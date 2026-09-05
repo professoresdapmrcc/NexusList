@@ -1,4 +1,4 @@
-
+ 
     (() => {
       "use strict";
 
@@ -561,6 +561,13 @@
         return workflow.expired.filter((member) => !member.rl);
       }
 
+      function licenseReturnActionBusy() {
+        return !appState.loaded || appState.loading || appState.savingMembers ||
+          appState.editingMembers || appState.removingMembers ||
+          appState.addingMember || appState.organizingMembers ||
+          appState.markingLicenseReturns;
+      }
+
       function licenseMemberNames(members) {
         return members
           .map((member) => String(member.nickname || "").trim())
@@ -596,11 +603,11 @@
           message.textContent =
             `${names}${pending.length > 3 ? " e mais membros" : ""} ${
               pending.length === 1 ? "pode" : "podem"
-            } ser marcado${pending.length === 1 ? "" : "s"} em RL. ` +
+            } ser marcado${pending.length === 1 ? "" : "s"} em RL. INÍCIO e DIAS serão limpos e salvos. ` +
             releaseMessage;
           action.hidden = false;
           action.disabled =
-            appState.markingLicenseReturns || !canCurrentUserEdit();
+            licenseReturnActionBusy() || !canCurrentUserEdit();
           action.textContent = appState.markingLicenseReturns
             ? "Marcando em RL…"
             : `Marcar ${formatCount(pending.length)} em RL`;
@@ -634,10 +641,11 @@
         if (!requireEditAccess()) return;
 
         const pending = expiredLicensesPendingRl();
-        if (!pending.length || appState.markingLicenseReturns) return;
+        if (!pending.length || licenseReturnActionBusy()) return;
 
         appState.markingLicenseReturns = true;
-        renderLicenseWorkflow();
+        appState.savingMembers = true;
+        updateMemberEditControls();
 
         try {
           const response = await requestNexusList("markLicenseReturnsAsRL", {
@@ -649,13 +657,26 @@
             )
           );
           const rlIndex = headerIndex("RL");
+          const persistedMembers = new Map(
+            ((response.data && response.data.updatedMembers) || []).map(
+              (member) => [Number(member.row), member]
+            )
+          );
 
           if (rlIndex >= 0) {
             appState.rows.forEach((member) => {
               if (!updatedRows.has(Number(member.row))) return;
+              const persisted = persistedMembers.get(Number(member.row));
               ["source", "saved", "values"].forEach((key) => {
-                if (Array.isArray(member[key])) member[key][rlIndex] = "true";
+                if (persisted && Array.isArray(persisted[key])) {
+                  member[key] = persisted[key].slice();
+                } else if (Array.isArray(member[key])) {
+                  // Compatibilidade com a API antiga: só confirma o RL.
+                  member[key][rlIndex] = "true";
+                }
               });
+              if (persisted) member.hasSaved = true;
+              appState.memberDrafts.delete(member.row);
             });
           }
 
@@ -674,16 +695,17 @@
           showToast(
             `${formatCount(updatedRows.size)} membro${
               updatedRows.size === 1 ? " foi marcado" : "s foram marcados"
-            } em RL e será${
-              updatedRows.size === 1 ? "" : "ão"
-            } liberado${updatedRows.size === 1 ? "" : "s"} na próxima segunda-feira.`,
+            } em RL.${persistedMembers.size === updatedRows.size
+              ? " INÍCIO e DIAS foram limpos e salvos."
+              : " Atualize a API para habilitar a limpeza de INÍCIO e DIAS."}`,
             "success"
           );
         } catch (error) {
           showToast(error.message, "error");
         } finally {
           appState.markingLicenseReturns = false;
-          renderLicenseWorkflow();
+          appState.savingMembers = false;
+          updateMemberEditControls();
         }
       }
 
@@ -1629,6 +1651,7 @@
 
         document.getElementById("refresh-members").disabled =
           isBusy || isEditing || isRemoving;
+        renderLicenseWorkflow();
       }
 
       function beginMemberEditing() {
