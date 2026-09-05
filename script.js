@@ -587,6 +587,9 @@
 
         if (pending.length) {
           const names = licenseMemberNames(pending);
+          const releaseMessage = workflow.automationActive
+            ? `O RL deste fluxo será desmarcado automaticamente na segunda-feira (${workflow.nextMonday}).`
+            : "A automação de segunda-feira ainda precisa ser autorizada pelo proprietário no Apps Script.";
           title.innerHTML =
             '<i class="ti ti-calendar-exclamation" aria-hidden="true"></i>' +
             `${formatCount(pending.length)} licença${pending.length === 1 ? " encerrada" : "s encerradas"}`;
@@ -594,7 +597,7 @@
             `${names}${pending.length > 3 ? " e mais membros" : ""} ${
               pending.length === 1 ? "pode" : "podem"
             } ser marcado${pending.length === 1 ? "" : "s"} em RL. ` +
-            `O RL deste fluxo será desmarcado automaticamente na segunda-feira (${workflow.nextMonday}).`;
+            releaseMessage;
           action.hidden = false;
           action.disabled =
             appState.markingLicenseReturns || !canCurrentUserEdit();
@@ -614,6 +617,15 @@
             `${names}${endingToday.length > 3 ? " e mais membros" : ""} ${
               endingToday.length === 1 ? "poderá" : "poderão"
             } ser marcado${endingToday.length === 1 ? "" : "s"} em RL a partir de 00:00 de amanhã, após 23:59 de hoje.`;
+          panel.hidden = false;
+          return;
+        }
+
+        if (!workflow.automationActive) {
+          title.innerHTML =
+            '<i class="ti ti-alert-triangle" aria-hidden="true"></i>Automação de RL pendente';
+          message.textContent =
+            "O proprietário da planilha deve executar configurarAutomacaoDeLicencas uma vez no editor do Apps Script para liberar os RLs automaticamente às segundas-feiras.";
           panel.hidden = false;
         }
       }
