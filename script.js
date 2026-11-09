@@ -346,6 +346,153 @@
         loaded: false
       };
 
+      // Never identify a person solely by a spreadsheet position.
+      // The server must enforce expectedRevision and idempotencyKey atomically.
+      Object.assign(appState, {
+        loadSequence: 0,
+        baseline: null,
+        revision: null,
+        formulaColumns: new Set(),
+        requiresRefresh: true,
+        writeUncertain: false,
+        settingsSaving: false,
+        publishingUncertain: false
+      });
+
+      function memberKey(values, headers = appState.headers) {
+        const index = headers.findIndex(header => headerKey(header) === "NICKNAME");
+        return String(values[index] ?? "").trim().toLocaleLowerCase("pt-BR");
+      }
+
+      function decodeBootstrap(response) {
+        if (!response || !response.data || !Array.isArray(response.data.headers) ||
+            !Array.isArray(response.data.rows) || !response.settings || !Array.isArray(response.settings.rows)) {
+          throw new Error("A API retornou uma estrutura incompleta. Nenhum dado foi substituído.");
+        }
+        const headers = response.data.headers.slice();
+        const keys = headers.map(headerKey);
+        if (!keys.includes("CARGO") || !keys.includes("NICKNAME") || new Set(keys).size !== keys.length || keys.some(key => !key)) {
+          throw new Error("Cabeçalhos inválidos ou repetidos na planilha. Corrija a estrutura antes de editar.");
+        }
+        const seenRows = new Set();
+        const seenMembers = new Set();
+        const rows = [];
+        for (const row of response.data.rows) {
+          if (!row || !Number.isInteger(Number(row.row)) || Number(row.row) < 2 || seenRows.has(Number(row.row))) {
+            throw new Error("A API retornou linhas inválidas ou repetidas.");
+          }
+          seenRows.add(Number(row.row));
+          // values is the API's canonical result. Do not overwrite it with source/saved.
+          const values = Array.isArray(row.values) ? row.values.slice()
+            : row.hasSaved && Array.isArray(row.saved) ? row.saved.slice()
+            : Array.isArray(row.source) ? row.source.slice() : null;
+          if (!values || values.length !== headers.length) throw new Error("Uma linha não corresponde aos cabeçalhos da planilha.");
+          if (!values.some(value => String(value ?? "").trim())) continue;
+          const key = memberKey(values, headers);
+          if (!key || seenMembers.has(key)) throw new Error("Nickname ausente ou duplicado na base. Corrija a planilha antes de editar.");
+          seenMembers.add(key);
+          rows.push({ ...row, row: Number(row.row), values, saved: values.slice(), hasSaved: true });
+        }
+        const formulaColumns = new Set();
+        for (const field of response.data.formulaColumns || []) {
+          const index = typeof field === "number" ? field : keys.indexOf(headerKey(field));
+          if (!Number.isInteger(index) || index < 0 || index >= headers.length) throw new Error("Configuração de colunas calculadas inválida.");
+          formulaColumns.add(index);
+        }
+        return { headers, rows, formulaColumns, revision: response.meta?.revision ?? response.data.revision ?? null };
+      }
+
+      function cellFingerprint(value, header) {
+        const key = headerKey(header);
+        const text = String(value ?? "").trim();
+        if (["G", "GP", "RL", "REB", "PA"].includes(key)) return text.toLowerCase();
+        if (DATE_HEADER_KEYS.includes(key) && parseNexusDate(text)) return nexusDateToIso(text);
+        return text;
+      }
+
+      function memberSnapshot(headers, rows, includePositions = true) {
+        return JSON.stringify({ headers: headers.map(headerKey), rows: rows.map(row => ({
+          key: memberKey(row.values, headers),
+          ...(includePositions ? { row: Number(row.row) } : {}),
+          values: row.values.map((value, index) => cellFingerprint(value, headers[index]))
+        })).sort((left, right) => left.key.localeCompare(right.key)) });
+      }
+
+      function editableSnapshot(rows) {
+        return JSON.stringify(rows.map(row => ({ key: memberKey(row.values), values: row.values
+          .map((value, index) => isFormulaMemberColumn(index) ? null : cellFingerprint(value, appState.headers[index]))
+        })).sort((left, right) => left.key.localeCompare(right.key)));
+      }
+
+      function requireFreshMembers() {
+        if (!appState.loaded || appState.loading || appState.requiresRefresh || appState.writeUncertain) {
+          throw new Error(appState.writeUncertain
+            ? "Uma gravação ficou sem confirmação. Aguarde sua conclusão e atualize a lista antes de outra alteração."
+            : "Atualize a lista com sucesso antes de alterar os membros.");
+        }
+      }
+
+      async function validateMemberBaseline() {
+        requireFreshMembers();
+        const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+        const latest = decodeBootstrap(response);
+        if (appState.baseline !== memberSnapshot(latest.headers, latest.rows) ||
+            (appState.revision !== null && latest.revision !== appState.revision)) {
+          appState.requiresRefresh = true;
+          throw new Error("A lista foi alterada desde a sua consulta. Preserve suas alterações e atualize a página antes de salvar.");
+        }
+        return { ...latest, response };
+      }
+
+      function acceptBootstrap(response, decoded = decodeBootstrap(response)) {
+        appState.headers = decoded.headers;
+        appState.rows = decoded.rows;
+        appState.formulaColumns = decoded.formulaColumns;
+        appState.revision = decoded.revision;
+        appState.baseline = memberSnapshot(decoded.headers, decoded.rows);
+        appState.maxDataRow = Math.max(1, ...decoded.rows.map(row => row.row));
+        appState.settings = response.settings.rows.map(item => ({ ...item, role: canonicalRoleName(item.role) }));
+        appState.additionalAccess = Array.isArray(response.additionalAccess?.nicknames) ? response.additionalAccess.nicknames.slice() : [];
+        appState.additionalAccessRoles = Array.isArray(response.additionalAccess?.roles) ? response.additionalAccess.roles.slice() : [];
+        appState.availableAccessRoles = Array.isArray(response.additionalAccess?.availableRoles)
+          ? response.additionalAccess.availableRoles.map(entry => ({ role: String(entry.role || "") })) : [];
+        appState.publishing = response.publishing || null;
+        appState.licenseWorkflow = response.licenses || null;
+        appState.booleanColumns = detectBooleanColumns();
+        sortMembers();
+        appState.selectedMemberRows.clear();
+        appState.memberDrafts.clear();
+        appState.requiresRefresh = false;
+        appState.writeUncertain = false;
+        appState.loaded = true;
+      }
+
+      function renderBootstrap(response) {
+        renderMembers(); renderLicenseWorkflow(); renderSettings(); renderAdditionalAccess();
+        updateAdditionalAccessRoleOptions();
+        document.getElementById("data-origin").textContent = "Dados sincronizados";
+        updateDataTimestamp(response.meta?.generatedAt);
+        setWorkspaceState("ready", "Sincronizado");
+      }
+
+      async function confirmMemberWrite(expectedRows) {
+        const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+        const decoded = decodeBootstrap(response);
+        if (memberSnapshot(appState.headers, []) !== memberSnapshot(decoded.headers, []) ||
+            editableSnapshot(decoded.rows) !== editableSnapshot(expectedRows)) {
+          appState.requiresRefresh = true;
+          throw new Error("A leitura após o envio não confirmou todos os valores. Atualize e confira a lista; não repita o envio automaticamente.");
+        }
+        acceptBootstrap(response, decoded);
+        renderBootstrap(response);
+        return decoded.rows;
+      }
+
+      function createOperationId() {
+        return window.crypto?.randomUUID ? window.crypto.randomUUID()
+          : "nexuslist-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+      }
+
       function buildWorkerUrl(targetUrl) {
         const url = new URL(CONFIG.workerProxy);
         url.searchParams.set("url", targetUrl);
@@ -416,11 +563,9 @@
       ) {
         const { forceRefresh = false } = options;
         const target = new URL(CONFIG.sheets.nexusListApi);
-        const requestedUsername = cleanCell(
-          (payload && payload.username) ||
-            (currentUser && currentUser.nick) ||
-            ""
-        );
+        const requestedUsername = cleanCell(action === "access"
+          ? payload?.username || currentUser?.nick || ""
+          : currentUser?.nick || payload?.username || "");
         const isWrite =
           action.startsWith("save") ||
           action === "addAdditionalAccess" ||
@@ -432,6 +577,22 @@
             "Seu usuário não possui acesso total para editar."
           );
         }
+        if ((action === "addAdditionalAccess" || action === "removeAdditionalAccess") && !requireManageAccess({ notify: false })) {
+          throw new Error("Somente a Liderança e Desenvolvedores podem gerenciar acessos.");
+        }
+        if (isWrite) {
+          requireFreshMembers();
+          if (appState.writeUncertain) throw new Error("Atualize e confira a gravação anterior antes de enviar outra alteração.");
+          const verified = await validateForumAccess();
+          if (!currentUser || cleanCell(verified.nick).toLocaleLowerCase("pt-BR") !== requestedUsername.toLocaleLowerCase("pt-BR")) {
+            throw new Error("O usuário do fórum mudou. Atualize a página antes de editar.");
+          }
+          allowAccess(verified);
+          if (!canCurrentUserEdit(verified) ||
+              (["addAdditionalAccess", "removeAdditionalAccess"].includes(action) && !canCurrentUserManageAccess(verified))) {
+            throw new Error("Sua permissão de edição não está mais ativa.");
+          }
+        }
         const request = {
           method: isWrite ? "POST" : "GET",
           cache: "no-store"
@@ -440,8 +601,9 @@
         if (isWrite) {
           request.headers = { "Content-Type": "text/plain;charset=utf-8" };
           request.body = JSON.stringify({
-            action,
             ...(payload || {}),
+            action,
+            idempotencyKey: payload?.idempotencyKey || createOperationId(),
             username: requestedUsername
           });
         } else {
@@ -483,12 +645,10 @@
               throw error;
             }
 
-            if (!response.ok || !result.ok) {
+            if (!result || typeof result !== "object" || !response.ok || result.ok !== true) {
               const message = result && result.error ? result.error : "Falha na API.";
-              if (/não autorizado/i.test(message)) {
-                throw new Error(
-                  "O Worker ainda precisa receber a chave segura da NexusList."
-                );
+              if (/não autorizado|sem permiss|acesso negado/i.test(message)) {
+                const denied = new Error(message); denied.code = "AUTH_DENIED"; throw denied;
               }
               const error = new Error(message);
               error.retryable =
@@ -501,6 +661,9 @@
             return result;
           } catch (error) {
             lastError = error;
+            if (isWrite && (error.name === "AbortError" || error instanceof TypeError || error.retryable === true || /resposta inválida/.test(error.message))) {
+              appState.writeUncertain = true; appState.requiresRefresh = true;
+            }
             const retryable =
               !isWrite &&
               (error.name === "AbortError" ||
@@ -520,7 +683,7 @@
 
         if (lastError && lastError.name === "AbortError") {
           throw new Error(
-            "O serviço demorou demais para responder. Tentamos novamente, mas a conexão não foi concluída."
+            isWrite ? "A gravação ficou sem confirmação por tempo limite. Ela pode ter sido aplicada. Aguarde e atualize antes de tentar outra alteração." : "O serviço demorou demais para responder após as tentativas de consulta."
           );
         }
         if (lastError instanceof TypeError) {
@@ -564,7 +727,7 @@
       function licenseReturnActionBusy() {
         return !appState.loaded || appState.loading || appState.savingMembers ||
           appState.editingMembers || appState.removingMembers ||
-          appState.addingMember || appState.organizingMembers ||
+          appState.addingMember || appState.organizingMembers || appState.requiresRefresh || appState.writeUncertain || appState.requirementsBusy ||
           appState.markingLicenseReturns;
       }
 
@@ -638,75 +801,46 @@
       }
 
       async function markLicenseReturnsAsRl() {
-        if (!requireEditAccess()) return;
-
-        const pending = expiredLicensesPendingRl();
-        if (!pending.length || licenseReturnActionBusy()) return;
-
-        appState.markingLicenseReturns = true;
-        appState.savingMembers = true;
+        if (!requireEditAccess() || licenseReturnActionBusy()) return;
+        appState.markingLicenseReturns = true; appState.savingMembers = true;
         updateMemberEditControls();
-
         try {
-          const response = await requestNexusList("markLicenseReturnsAsRL", {
-            rows: pending.map((member) => member.row)
+          const latest = await validateMemberBaseline();
+          const pending = Array.isArray(latest.response.licenses?.expired)
+            ? latest.response.licenses.expired.filter(member => !member.rl) : [];
+          if (!pending.length) throw new Error("Não há retornos de licença confirmados pela consulta atual.");
+          const nicknameIndex = memberFieldIndexes().nickname;
+          const identities = pending.map(member => {
+            const row = latest.rows.find(row => row.row === Number(member.row));
+            const nickname = String(member.nickname || "").trim().toLocaleLowerCase("pt-BR");
+            if (!row || !nickname || memberKey(row.values) !== nickname) {
+              throw new Error("O retorno de licença não corresponde ao membro da linha. Atualize a lista; nenhum envio foi feito.");
+            }
+            return { row: row.row, nickname: row.values[nicknameIndex], memberId: row.id ?? row.uid ?? null };
           });
-          const updatedRows = new Set(
-            ((response.data && response.data.rows) || pending.map((member) => member.row)).map(
-              Number
-            )
-          );
-          const rlIndex = headerIndex("RL");
-          const persistedMembers = new Map(
-            ((response.data && response.data.updatedMembers) || []).map(
-              (member) => [Number(member.row), member]
-            )
-          );
-
-          if (rlIndex >= 0) {
-            appState.rows.forEach((member) => {
-              if (!updatedRows.has(Number(member.row))) return;
-              const persisted = persistedMembers.get(Number(member.row));
-              ["source", "saved", "values"].forEach((key) => {
-                if (persisted && Array.isArray(persisted[key])) {
-                  member[key] = persisted[key].slice();
-                } else if (Array.isArray(member[key])) {
-                  // Compatibilidade com a API antiga: só confirma o RL.
-                  member[key][rlIndex] = "true";
-                }
-              });
-              if (persisted) member.hasSaved = true;
-              appState.memberDrafts.delete(member.row);
-            });
+          const result = await requestNexusList("markLicenseReturnsAsRL", {
+            rows: identities.map(member => member.row), members: identities,
+            expectedRevision: latest.revision, expectedSnapshot: appState.baseline,
+            idempotencyKey: createOperationId()
+          });
+          const confirmed = result.data?.rows;
+          if (!Array.isArray(confirmed) || identities.some(member => !confirmed.map(Number).includes(member.row))) {
+            throw new Error("A API não confirmou quais retornos foram alterados. Atualize a lista e confira o resultado.");
           }
-
-          appState.licenseWorkflow = {
-            ...appState.licenseWorkflow,
-            expired: (appState.licenseWorkflow.expired || []).map((member) =>
-              updatedRows.has(Number(member.row))
-                ? { ...member, rl: true, scheduledForRelease: true }
-                : member
-            )
-          };
-          appState.booleanColumns = detectBooleanColumns();
-          renderMembers();
-          updateDataTimestamp();
-          setWorkspaceState("ready", "Sincronizado");
-          showToast(
-            `${formatCount(updatedRows.size)} membro${
-              updatedRows.size === 1 ? " foi marcado" : "s foram marcados"
-            } em RL.${persistedMembers.size === updatedRows.size
-              ? " INÍCIO e DIAS foram limpos e salvos."
-              : " Atualize a API para habilitar a limpeza de INÍCIO e DIAS."}`,
-            "success"
-          );
-        } catch (error) {
-          showToast(error.message, "error");
-        } finally {
-          appState.markingLicenseReturns = false;
-          appState.savingMembers = false;
-          updateMemberEditControls();
-        }
+          const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          const decoded = decodeBootstrap(response);
+          const rlIndex = decoded.headers.findIndex(header => headerKey(header) === "RL");
+          const startIndex = decoded.headers.findIndex(header => headerKey(header) === "INICIO");
+          const daysIndex = decoded.headers.findIndex(header => headerKey(header) === "DIAS");
+          if (rlIndex < 0 || startIndex < 0 || daysIndex < 0 || identities.some(member => {
+            const row = decoded.rows.find(row => memberKey(row.values, decoded.headers) === member.nickname.toLocaleLowerCase("pt-BR"));
+            return !row || booleanState(row.values[rlIndex]) !== "true" ||
+              String(row.values[startIndex] ?? "").trim() || String(row.values[daysIndex] ?? "").trim();
+          })) throw new Error("O RL e a limpeza da licença não foram confirmados. Confira a planilha antes de prosseguir.");
+          acceptBootstrap(response, decoded); renderBootstrap(response);
+          showToast(formatCount(identities.length) + " retornos confirmados na planilha.", "success");
+        } catch (error) { appState.requiresRefresh = true; showToast(error.message, "error"); }
+        finally { appState.markingLicenseReturns = false; appState.savingMembers = false; updateMemberEditControls(); }
       }
 
       function formatCount(value) {
@@ -760,7 +894,8 @@
       }
 
       function isFormulaMemberColumn(index) {
-        return index === 4 || index === 9;
+        return appState.formulaColumns.has(index) || ["RETORNO", "TERMINO", "TEMPO", "TEMPODECARGO", "TEMPONOCARGO", "TEMPODECOMPANHIA", "DIASNOCARGO", "DIASDECOMPANHIA"]
+          .includes(headerKey(appState.headers[index]));
       }
 
       function canonicalRoleName(role) {
@@ -899,40 +1034,22 @@
 
       function calculateMemberReturnDate(startValue, daysValue) {
         const start = parseNexusDate(startValue);
-        const daysText = String(daysValue ?? "").trim();
-        if (!start || !/^\d+$/.test(daysText)) return "";
-
-        const days = Number(daysText);
-        if (!Number.isSafeInteger(days) || days < 0) return "";
-        const date = new Date(
-          Date.UTC(start.year, start.month, start.day) +
-            days * 24 * 60 * 60 * 1000
-        );
-        return formatNexusDate(
-          `${date.getUTCFullYear()}-${String(
-            date.getUTCMonth() + 1
-          ).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`
-        );
+        const text = String(daysValue ?? "").trim();
+        if (!start || !/^\d+$/.test(text)) return "";
+        const days = Number(text);
+        if (!Number.isSafeInteger(days) || days <= 0) return "";
+        const date = new Date(Date.UTC(start.year, start.month, start.day) + days * 86400000);
+        if (!Number.isFinite(date.getTime()) || date.getUTCFullYear() > 9999) return "";
+        return formatNexusDate(date.toISOString().slice(0, 10));
       }
 
-      function applyCalculatedReturnDate(values, options = {}) {
-        const nextValues = values.slice();
+      function applyCalculatedReturnDate(values) {
+        const next = values.slice();
         const indexes = memberFieldIndexes();
-        if (
-          indexes.licenseStart < 0 ||
-          indexes.licenseDays < 0 ||
-          indexes.licenseReturn < 0
-        ) {
-          return nextValues;
+        if (indexes.licenseReturn >= 0 && indexes.licenseStart >= 0 && indexes.licenseDays >= 0) {
+          next[indexes.licenseReturn] = calculateMemberReturnDate(next[indexes.licenseStart], next[indexes.licenseDays]);
         }
-        const calculated = calculateMemberReturnDate(
-          nextValues[indexes.licenseStart],
-          nextValues[indexes.licenseDays]
-        );
-        if (calculated || options.clearIncomplete) {
-          nextValues[indexes.licenseReturn] = calculated;
-        }
-        return nextValues;
+        return next;
       }
 
       function normalizeConsultantValues(values) {
@@ -950,6 +1067,7 @@
 
       function prepareMemberValues(values) {
         const currentValues = applyCalculatedReturnDate(values);
+        validateLicenseValues(currentValues);
         const roleIndex = memberFieldIndexes().role;
         if (roleIndex >= 0) {
           currentValues[roleIndex] = canonicalRoleName(
@@ -969,8 +1087,23 @@
         );
       }
 
+      function validateLicenseValues(values) {
+        if (isConsultantRole(values[memberFieldIndexes().role])) return;
+        const { licenseStart, licenseDays } = memberFieldIndexes();
+        const start = String(values[licenseStart] ?? "").trim();
+        const days = String(values[licenseDays] ?? "").trim();
+        if (!start && !days) return;
+        if (licenseStart < 0 || licenseDays < 0 || !calculateMemberReturnDate(start, days)) {
+          throw new Error("Licença inválida: informe início válido e um número inteiro positivo de dias.");
+        }
+      }
+
       function assertRequiredMemberFields(values, rowNumber = null) {
+        validateLicenseValues(values);
         const indexes = memberFieldIndexes();
+        for (const index of [indexes.entry, indexes.promotion]) {
+          if (index >= 0 && String(values[index] ?? "").trim() && !parseNexusDate(values[index])) throw new Error("Data inválida no cadastro do membro.");
+        }
         const missing = [
           { index: indexes.role, label: "CARGO" },
           { index: indexes.nickname, label: "NICKNAME" }
@@ -1063,26 +1196,30 @@
         return rows;
       }
 
-      function applyPersistedMemberRows(rows) {
-        appState.rows = rows.map((item) => ({
-          row: item.row,
-          source: item.values.slice(),
-          saved: item.values.slice(),
-          values: item.values.slice(),
-          hasSaved: true
-        }));
-        appState.maxDataRow = rows.length
-          ? rows[rows.length - 1].row
-          : 1;
-        appState.selectedMemberRows.clear();
-        appState.booleanColumns = detectBooleanColumns();
+      function applyPersistedMemberRows() {
+        throw new Error("Use a leitura confirmada da API para atualizar a lista.");
       }
 
       async function persistCompactMemberList(members) {
         const rows = buildCompactMemberRows(members);
-        await requestNexusList("organizeData", { rows });
-        applyPersistedMemberRows(rows);
-        return rows;
+        const latest = await validateMemberBaseline();
+        const indexes = memberFieldIndexes();
+        const originals = new Map(latest.rows.map(row => [memberKey(row.values), row]));
+        const operationId = createOperationId();
+        try {
+          await requestNexusList("organizeData", {
+            rows: rows.map(row => ({ ...row, memberKey: memberKey(row.values),
+              expectedNickname: originals.get(memberKey(row.values))?.values[indexes.nickname] ?? null })),
+            expectedRevision: latest.revision,
+            expectedSnapshot: appState.baseline,
+            originalMembers: latest.rows.map(row => ({ row: row.row, nickname: row.values[indexes.nickname] })),
+            idempotencyKey: operationId
+          });
+          return await confirmMemberWrite(rows);
+        } catch (error) {
+          appState.requiresRefresh = true;
+          throw error;
+        }
       }
 
       function filteredMembers() {
@@ -1104,28 +1241,8 @@
       }
 
       function detectBooleanColumns() {
-        const columns = new Set();
-
-        appState.headers.forEach((_, index) => {
-          const header = String(appState.headers[index] || "")
-            .trim()
-            .toUpperCase();
-          const populated = appState.rows
-            .map((row) => booleanState(row.values[index]))
-            .filter((state) => state !== "empty");
-
-          if (
-            ["G", "GP", "RL", "REB", "PA"].includes(header) ||
-            (populated.length &&
-              populated.every(
-                (state) => state === "true" || state === "false"
-              ))
-          ) {
-            columns.add(index);
-          }
-        });
-
-        return columns;
+        return new Set(appState.headers.map((header, index) =>
+          ["G", "GP", "RL", "REB", "PA"].includes(headerKey(header)) ? index : -1).filter(index => index >= 0));
       }
 
       function memberDraft(row) {
@@ -1133,9 +1250,7 @@
       }
 
       function memberEditableValues(row) {
-        return row.hasSaved && Array.isArray(row.saved)
-          ? row.saved
-          : row.values;
+        return row.values;
       }
 
       function isMemberRowDirty(row) {
@@ -1194,7 +1309,7 @@
           select.appendChild(current);
         }
 
-        ROLE_OPTIONS.forEach((role) => {
+        [...new Set([...ROLE_OPTIONS, ...appState.settings.map(item => canonicalRoleName(item.role)).filter(Boolean)])].forEach((role) => {
           const option = document.createElement("option");
           option.value = role;
           option.textContent = role;
@@ -1267,7 +1382,7 @@
             draft[columnIndex] = nextRole;
             appState.memberDrafts.set(
               row.row,
-              normalizeConsultantValues(draft)
+              draft
             );
             renderMembers();
           }
@@ -1586,7 +1701,7 @@
           appState.loading ||
           appState.savingMembers ||
           appState.addingMember ||
-          appState.requirementsBusy;
+          appState.requirementsBusy || appState.requiresRefresh || appState.writeUncertain || appState.settingsSaving;
 
         editButton.hidden = !canEdit || isEditing || isRemoving;
         addButton.hidden = !canEdit || isEditing || isRemoving;
@@ -1609,7 +1724,7 @@
           !canEdit || isBusy || !appState.loaded || !appState.rows.length;
         removeButton.disabled =
           !canEdit || isBusy || !appState.loaded || !appState.rows.length;
-        saveButton.disabled = !canEdit || appState.savingMembers;
+        saveButton.disabled = !canEdit || isBusy;
         cancelEditButton.disabled = appState.savingMembers;
         confirmRemoveButton.disabled =
           appState.savingMembers || !appState.selectedMemberRows.size;
@@ -1656,6 +1771,7 @@
 
       function beginMemberEditing() {
         if (!requireEditAccess()) return;
+        try { requireFreshMembers(); } catch (error) { showToast(error.message, "warning"); return; }
         if (
           !appState.loaded ||
           appState.editingMembers ||
@@ -1668,7 +1784,7 @@
         appState.memberDrafts = new Map(
           appState.rows.map((row) => [
             row.row,
-            applyCalculatedReturnDate(memberEditableValues(row))
+            memberEditableValues(row).slice()
           ])
         );
         appState.booleanColumns = detectBooleanColumns();
@@ -1683,7 +1799,7 @@
 
         appState.editingMembers = false;
         appState.memberDrafts.clear();
-        setWorkspaceState("ready", "Sincronizado");
+        setWorkspaceState(appState.requiresRefresh ? "error" : "ready", appState.requiresRefresh ? "Atualização necessária" : "Sincronizado");
         updateMemberEditControls();
         renderMembers();
       }
@@ -1738,67 +1854,28 @@
       }
 
       async function saveMemberList() {
-        if (!requireEditAccess()) return;
-        if (!appState.editingMembers || appState.savingMembers) return;
-
-        const changedRows = appState.rows
-          .filter(isMemberRowDirty)
-          .map((row) => ({
-            row: row.row,
-            values: prepareMemberValues(memberDraft(row)).map((value) =>
-              String(value ?? "").trim()
-            )
-          }));
-
-        if (!changedRows.length) {
-          cancelMemberEditing();
-          showToast("Nenhuma alteração para salvar.", "info");
-          return;
-        }
-
+        if (!requireEditAccess() || !appState.editingMembers || appState.savingMembers) return;
+        let changedRows;
+        let members;
         try {
-          changedRows.forEach((item) =>
-            assertRequiredMemberFields(item.values, item.row)
-          );
-        } catch (error) {
-          showToast(error.message, "warning");
-          return;
-        }
-
+          requireFreshMembers();
+          changedRows = appState.rows.filter(isMemberRowDirty);
+          if (!changedRows.length) { cancelMemberEditing(); showToast("Nenhuma alteração para salvar.", "info"); return; }
+          const destructive = changedRows.some(row => !isConsultantRole(row.values[memberFieldIndexes().role]) &&
+            isConsultantRole(memberDraft(row)[memberFieldIndexes().role]));
+          if (destructive && !window.confirm("Ao salvar como Consultor(a), datas e marcações não aplicáveis serão removidas. Confirmar?")) return;
+          members = appState.rows.map(row => ({ ...row, values: prepareMemberValues(memberDraft(row)).map(value => String(value ?? "").trim()) }));
+          members.forEach(row => assertRequiredMemberFields(row.values, row.row));
+        } catch (error) { showToast(error.message, "warning"); return; }
         appState.savingMembers = true;
-        setWorkspaceState("", "Salvando");
-        updateMemberEditControls();
-        renderMembers();
-
+        updateMemberEditControls(); renderMembers(); setWorkspaceState("", "Salvando");
         try {
-          await persistCompactMemberList(
-            appState.rows.map((row) => ({
-              ...row,
-              values: prepareMemberValues(memberDraft(row)).map((value) =>
-                String(value ?? "").trim()
-              )
-            }))
-          );
+          await persistCompactMemberList(members);
           appState.editingMembers = false;
           appState.memberDrafts.clear();
-          updateDataTimestamp();
-          setWorkspaceState("ready", "Sincronizado");
-          showToast(
-            `${formatCount(changedRows.length)} registro${
-              changedRows.length === 1 ? "" : "s"
-            } salvo${
-              changedRows.length === 1 ? "" : "s"
-            } e lista organizada.`,
-            "success"
-          );
-        } catch (error) {
-          setWorkspaceState("error", "Falha ao salvar");
-          showToast(error.message, "error");
-        } finally {
-          appState.savingMembers = false;
-          updateMemberEditControls();
-          renderMembers();
-        }
+          showToast(formatCount(changedRows.length) + " registros confirmados na planilha.", "success");
+        } catch (error) { setWorkspaceState("error", "Confira a gravação"); showToast(error.message, "error"); }
+        finally { appState.savingMembers = false; updateMemberEditControls(); renderMembers(); }
       }
 
       function createAddBooleanField(label, index) {
@@ -1929,6 +2006,7 @@
 
       function openAddMemberEditor() {
         if (!requireEditAccess()) return;
+        try { requireFreshMembers(); } catch (error) { showToast(error.message, "warning"); return; }
         if (
           !appState.loaded ||
           appState.editingMembers ||
@@ -1948,7 +2026,7 @@
         booleanGroup.className = "add-member-boolean-group";
 
         appState.headers.forEach((header, index) => {
-          if (isFormulaMemberColumn(index)) return;
+          if (isFormulaMemberColumn(index) && index !== indexes.licenseReturn) return;
 
           const label = header || `Campo ${index + 1}`;
           let field;
@@ -2050,7 +2128,10 @@
         if (!appState.addingMember || appState.savingMembers) return;
 
         const indexes = memberFieldIndexes();
-        const values = prepareMemberValues(
+        let values;
+        try {
+          requireFreshMembers();
+          values = prepareMemberValues(
           appState.headers.map((_, index) => {
             if (isFormulaMemberColumn(index)) return "";
 
@@ -2074,6 +2155,8 @@
               .value.trim();
           })
         );
+
+        } catch (error) { showToast(error.message, "warning"); return; }
 
         const newRowNumber = Math.max(appState.maxDataRow, 1) + 1;
         const newMemberRows = buildNewMemberRows(values, newRowNumber);
@@ -2139,6 +2222,7 @@
 
       function beginMemberRemoval() {
         if (!requireEditAccess()) return;
+        try { requireFreshMembers(); } catch (error) { showToast(error.message, "warning"); return; }
         if (
           !appState.loaded ||
           !appState.rows.length ||
@@ -2364,25 +2448,39 @@
         updateAdditionalAccessRoleOptions();
       }
 
-      async function removeAdditionalAccess(accessType, value, button) {
-        if (!requireManageAccess()) return;
-        button.disabled = true;
+      function accessValues(response, accessType) {
+        const access = response.additionalAccess;
+        if (!access || !Array.isArray(access.nicknames) || !Array.isArray(access.roles)) throw new Error("A API não confirmou a lista de acessos.");
+        return (accessType === "cargo" ? access.roles : access.nicknames).map(value => normalizeLookup(value)).sort();
+      }
 
+      async function persistAdditionalAccess(action, accessType, value) {
+        requireFreshMembers();
+        const before = await requestNexusList("bootstrap", null, { forceRefresh: true });
+        decodeBootstrap(before);
+        const serverValues = accessValues(before, accessType);
+        const localValues = (accessType === "cargo" ? appState.additionalAccessRoles : appState.additionalAccess).map(value => normalizeLookup(value)).sort();
+        if (JSON.stringify(serverValues) !== JSON.stringify(localValues)) throw new Error("Os acessos mudaram. Atualize antes de alterar.");
+        const result = await requestNexusList(action, { accessType, value, expectedRevision: before.meta?.revision ?? null });
+        accessValues(result, accessType);
+        const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+        const decoded = decodeBootstrap(response);
+        const values = accessValues(response, accessType);
+        const targets = (accessType === "cargo" ? [value] : splitMemberNicknames(value)).map(value => normalizeLookup(value));
+        if (!targets.length || targets.some(target => values.includes(target) !== (action === "addAdditionalAccess"))) throw new Error("A leitura não confirmou a alteração de acesso. Confira antes de tentar novamente.");
+        acceptBootstrap(response, decoded); renderBootstrap(response);
+        return result;
+      }
+
+      async function removeAdditionalAccess(accessType, value, button) {
+        if (!requireManageAccess() || appState.settingsSaving) return;
+        appState.settingsSaving = true; button.disabled = true; updateMemberEditControls();
         try {
-          const response = await requestNexusList(
-            "removeAdditionalAccess",
-            { accessType, value }
-          );
-          applyAdditionalAccessState(response.additionalAccess || {});
-          showToast(
-            `${accessType === "cargo" ? "Cargo" : "Nickname"} removido dos acessos adicionais.`,
-            "success"
-          );
+          await persistAdditionalAccess("removeAdditionalAccess", accessType, value);
+          showToast("Acesso removido e confirmado na planilha.", "success");
           revalidateAuthentication().catch(() => {});
-        } catch (error) {
-          button.disabled = false;
-          showToast(error.message, "error");
-        }
+        } catch (error) { appState.requiresRefresh = true; showToast(error.message, "error"); }
+        finally { appState.settingsSaving = false; button.disabled = false; updateMemberEditControls(); }
       }
 
       function updateAdditionalAccessRoleOptions() {
@@ -2438,49 +2536,21 @@
 
       async function saveAdditionalAccess(event) {
         event.preventDefault();
-        if (!requireManageAccess()) return;
-
-        const accessType = document.getElementById(
-          "additional-access-type"
-        ).value;
+        if (!requireManageAccess() || appState.settingsSaving) return;
+        const accessType = document.getElementById("additional-access-type").value;
         const input = document.getElementById("additional-access-value");
         const roleSelect = document.getElementById("additional-access-role");
-        const value = (accessType === "cargo"
-          ? roleSelect.value
-          : input.value
-        ).trim();
+        const value = (accessType === "cargo" ? roleSelect.value : input.value).trim();
         if (!value) return;
-
         const button = document.getElementById("save-additional-access");
-        button.disabled = true;
-        button.textContent = "Adicionando…";
-
+        appState.settingsSaving = true; button.disabled = true; button.textContent = "Adicionando…";
+        updateMemberEditControls();
         try {
-          const response = await requestNexusList("addAdditionalAccess", {
-            accessType,
-            value
-          });
-          const result = response.additionalAccess || {};
-          applyAdditionalAccessState(result);
-          input.value = "";
-          roleSelect.value = "";
-          const addedCount = Array.isArray(result.added)
-            ? result.added.length
-            : 1;
-          if (addedCount) {
-            showToast(
-              `${result.addedType === "cargo" ? "Cargo" : "Nickname"} adicionado aos acessos adicionais.`,
-              "success"
-            );
-          } else {
-            showToast("Este acesso adicional já está configurado.", "info");
-          }
-        } catch (error) {
-          showToast(error.message, "error");
-        } finally {
-          button.disabled = false;
-          button.textContent = "Adicionar acesso";
-        }
+          await persistAdditionalAccess("addAdditionalAccess", accessType, value);
+          input.value = ""; roleSelect.value = "";
+          showToast("Acesso confirmado na planilha.", "success");
+        } catch (error) { appState.requiresRefresh = true; showToast(error.message, "error"); }
+        finally { appState.settingsSaving = false; button.disabled = false; button.textContent = "Adicionar acesso"; updateMemberEditControls(); }
       }
 
       function getLayoutOwner() {
@@ -2664,7 +2734,7 @@
         const button = document.getElementById("post-requirements-stamp");
         const complete = Array.from(requirementTagValue()).length === 3;
         button.disabled =
-          appState.requirementsBusy ||
+          appState.requirementsBusy || appState.publishingUncertain ||
           !complete ||
           !hasRequirementConfiguration();
         button.textContent = appState.requirementsBusy
@@ -2741,6 +2811,7 @@
 
       async function postRequirementsStamp() {
         if (!requireEditAccess() || appState.requirementsBusy) return;
+        if (appState.publishingUncertain) { showToast("Confira o tópico para saber se a postagem anterior foi publicada. Recarregue somente após conferir.", "warning"); return; }
         const tag = requirementTagValue();
         if (Array.from(tag).length !== 3) {
           showToast("A TAG deve ter exatamente três caracteres.", "warning");
@@ -2801,13 +2872,47 @@
         );
       }
 
-      async function fetchForumDocument(url) {
-        const response = await fetch(url, {
-          credentials: "include",
-          redirect: "follow",
-          cache: "no-store"
+      async function fetchForumWithTimeout(url, options = {}) {
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), CONFIG.forum.bridgeTimeoutMs);
+        try {
+          const response = await fetch(url, { ...options, signal: controller.signal });
+          const html = await response.text();
+          return { response, html };
+        } catch (error) {
+          if (error.name === "AbortError") {
+            const uncertain = options.method === "POST";
+            if (uncertain) appState.publishingUncertain = true;
+            throw new Error(uncertain ? "O fórum não confirmou a postagem a tempo. Confira o tópico antes de tentar novamente." : "O fórum demorou demais para responder.");
+          }
+          if (options.method === "POST") appState.publishingUncertain = true;
+          throw error;
+        } finally { window.clearTimeout(timeout); }
+      }
+
+      function confirmedForumPost(documentNode, responseUrl, topicId) {
+        const error = documentNode.querySelector(".message-die, .error, .panel .error, .block-error");
+        if (error?.textContent.trim()) throw new Error(error.textContent.trim());
+        const candidates = [responseUrl];
+        documentNode.querySelectorAll('meta[http-equiv="refresh" i]').forEach(meta => {
+          const match = (meta.getAttribute("content") || "").match(/url\s*=\s*['"]?([^'";]+)/i);
+          if (match) candidates.push(new URL(match[1], CONFIG.forum.origin).href);
         });
-        const html = await response.text();
+        const success = /mensagem.{0,40}(?:enviada|publicada|registrada)|(?:enviad|publicad)[ao].{0,30}sucesso|message.{0,40}(?:posted|sent)/i
+          .test(documentNode.body?.textContent || "");
+        if (success) documentNode.querySelectorAll('a[href]').forEach(link => {
+          if (/ver|visualizar|mensagem|postagem|message|post|view/i.test(link.textContent || "")) candidates.push(new URL(link.getAttribute("href"), CONFIG.forum.origin).href);
+        });
+        return candidates.find(value => {
+          const url = new URL(value, CONFIG.forum.origin);
+          const topic = /^\/t(\d+)(?:p\d+)?(?:-|$)/.exec(url.pathname);
+          return url.origin === CONFIG.forum.origin && topic && topic[1] === String(topicId) &&
+            (/^#(?:p|msg)?\d+$/.test(url.hash) || /^\d+$/.test(url.searchParams.get("p") || ""));
+        }) || null;
+      }
+
+      async function fetchForumDocument(url) {
+        const { response, html } = await fetchForumWithTimeout(url, { credentials: "include", redirect: "follow", cache: "no-store" });
         const documentNode = parseForumDocument(html);
 
         if (!response.ok) {
@@ -2883,13 +2988,7 @@
         if (action.origin !== CONFIG.forum.origin) {
           throw new Error("O formulário do fórum apontou para uma origem inesperada.");
         }
-        const response = await fetch(action, {
-          method: "POST",
-          credentials: "include",
-          redirect: "follow",
-          body
-        });
-        const html = await response.text();
+        const { response, html } = await fetchForumWithTimeout(action, { method: "POST", credentials: "include", redirect: "follow", body });
         const resultDocument = parseForumDocument(html);
 
         if (!response.ok) {
@@ -2909,7 +3008,13 @@
           throw new Error(error.trim());
         }
 
-        return response.url;
+        const topicId = new URL(formUrl, CONFIG.forum.origin).searchParams.get("t");
+        const confirmed = confirmedForumPost(resultDocument, response.url, topicId);
+        if (!confirmed) {
+          appState.publishingUncertain = true;
+          throw new Error("Não foi possível confirmar a publicação. Confira o tópico antes de tentar novamente.");
+        }
+        return confirmed;
       }
 
       async function replyForumTopic(topicId, bbcode) {
@@ -2932,50 +3037,38 @@
 
       function publishThroughForumBridge(popup, request) {
         return new Promise((resolve, reject) => {
+          let sent = false;
           const timeout = window.setTimeout(() => {
             cleanup();
-            reject(
-              new Error(
-                "A ponte do Forumeiros não respondeu. Instale ou atualize o script NexusList-Forumeiros-Bridge.js."
-              )
-            );
+            if (sent) appState.publishingUncertain = true;
+            reject(new Error(sent
+              ? "O fórum não confirmou o resultado. Confira o tópico antes de tentar novamente."
+              : "Atualize o NexusList-Forumeiros-Bridge.js no fórum para habilitar a ponte com confirmação."));
           }, CONFIG.forum.bridgeTimeoutMs);
           const interval = window.setInterval(() => {
             if (popup.closed) {
-              cleanup();
-              reject(new Error("A janela do fórum foi fechada antes do envio."));
-              return;
+              cleanup(); if (sent) appState.publishingUncertain = true;
+              reject(new Error("A janela foi fechada. Confira o tópico antes de repetir a postagem.")); return;
             }
-            popup.postMessage(request, CONFIG.forum.origin);
+            // Only repeat a harmless readiness probe. Never replay the write.
+            if (!sent) popup.postMessage({ type: "NEXUSLIST_FORUM_HELLO", requestId: request.requestId }, CONFIG.forum.origin);
           }, 900);
-
           function cleanup() {
-            window.clearTimeout(timeout);
-            window.clearInterval(interval);
+            window.clearTimeout(timeout); window.clearInterval(interval);
             window.removeEventListener("message", onMessage);
           }
-
           function onMessage(event) {
-            if (
-              event.origin !== CONFIG.forum.origin ||
-              event.source !== popup ||
-              !event.data ||
-              event.data.type !== "NEXUSLIST_FORUM_RESULT" ||
-              event.data.requestId !== request.requestId
-            ) {
-              return;
+            if (event.origin !== CONFIG.forum.origin || event.source !== popup || event.data?.requestId !== request.requestId) return;
+            if (event.data.type === "NEXUSLIST_FORUM_READY" && !sent) {
+              sent = true; popup.postMessage(request, CONFIG.forum.origin); return;
             }
-
+            if (event.data.type !== "NEXUSLIST_FORUM_RESULT" || !sent) return;
             cleanup();
-            if (event.data.ok) {
-              resolve(event.data);
-            } else {
-              reject(new Error(event.data.error || "Falha ao publicar no fórum."));
-            }
+            if (event.data.ok === true && event.data.postUrl) resolve(event.data);
+            else { appState.publishingUncertain = event.data.uncertain === true; reject(new Error(event.data.error || "Publicação não confirmada.")); }
           }
-
           window.addEventListener("message", onMessage);
-          popup.postMessage(request, CONFIG.forum.origin);
+          popup.postMessage({ type: "NEXUSLIST_FORUM_HELLO", requestId: request.requestId }, CONFIG.forum.origin);
         });
       }
 
@@ -3001,134 +3094,34 @@
       }
 
       async function loadNexusList(options = {}) {
-        const { quiet = false, forceSource = false } = options;
+        const { quiet = false } = options;
+        if (appState.editingMembers || appState.removingMembers || appState.addingMember || appState.savingMembers || appState.settingsSaving) {
+          if (!quiet) showToast("Conclua ou cancele a edição antes de atualizar a lista.", "warning");
+          return false;
+        }
+        const sequence = ++appState.loadSequence;
         setDataLoading(true);
         setWorkspaceState("", "Sincronizando");
-
-        if (!appState.loaded) {
-          const table = document.getElementById("members-table");
-          const tableState = document.getElementById("table-state");
-          table.hidden = true;
-          tableState.hidden = false;
-          tableState.textContent = "Carregando a base de membros…";
-        }
-
         try {
-          const response = await requestNexusList(
-            "bootstrap",
-            null,
-            forceSource ? { forceRefresh: true } : {}
-          );
-          const responseRows = response.data.rows || [];
-          const incomingRows = forceSource
-            ? responseRows.filter(
-                (row) =>
-                  (Array.isArray(row.source) &&
-                    row.source.some((value) => String(value ?? "").trim())) ||
-                  (Array.isArray(row.saved) &&
-                    row.saved.some((value) => String(value ?? "").trim()))
-              )
-            : responseRows;
-          appState.headers =
-            forceSource && Array.isArray(response.data.sourceHeaders)
-              ? response.data.sourceHeaders.slice()
-              : response.data.headers || [];
-          appState.maxDataRow = incomingRows.reduce(
-            (maximum, row) => Math.max(maximum, Number(row.row) || 1),
-            1
-          );
-          const roleIndex = memberFieldIndexes().role;
-          appState.rows = incomingRows.map((row) => {
-            const normalizedRow = { ...row };
-            if (forceSource) {
-              const sourceValues = Array.isArray(row.source)
-                ? row.source.slice()
-                : [];
-              const savedValues = Array.isArray(row.saved)
-                ? row.saved.slice()
-                : [];
-              const hasSource = sourceValues.some((value) =>
-                String(value ?? "").trim()
-              );
-              normalizedRow.source = sourceValues.slice();
-              normalizedRow.saved = savedValues.slice();
-              normalizedRow.values = hasSource
-                ? sourceValues.slice()
-                : savedValues.slice();
-              normalizedRow.hasSaved = savedValues.some((value) =>
-                String(value ?? "").trim()
-              );
-            }
-            ["source", "saved", "values"].forEach((key) => {
-              if (!Array.isArray(row[key])) return;
-              normalizedRow[key] = row[key].slice();
-              if (roleIndex >= 0) {
-                normalizedRow[key][roleIndex] = canonicalRoleName(
-                  normalizedRow[key][roleIndex]
-                );
-              }
-            });
-            return normalizedRow;
-          });
-          appState.settings = (response.settings.rows || []).map((item) => ({
-            ...item,
-            role: canonicalRoleName(item.role)
-          }));
-          appState.additionalAccess = Array.isArray(
-            response.additionalAccess && response.additionalAccess.nicknames
-          )
-            ? response.additionalAccess.nicknames.slice()
-            : [];
-          appState.additionalAccessRoles = Array.isArray(
-            response.additionalAccess && response.additionalAccess.roles
-          )
-            ? response.additionalAccess.roles.slice()
-            : [];
-          appState.availableAccessRoles = Array.isArray(
-            response.additionalAccess &&
-              response.additionalAccess.availableRoles
-          )
-            ? response.additionalAccess.availableRoles.map((entry) => ({
-                role: String(entry.role || "")
-              }))
-            : [];
-          appState.publishing = response.publishing || null;
-          appState.licenseWorkflow = response.licenses || null;
-          appState.booleanColumns = detectBooleanColumns();
-          sortMembers();
-          appState.selectedMemberRows.clear();
-          appState.loaded = true;
-
-          renderMembers();
-          renderLicenseWorkflow();
-          renderSettings();
-          renderAdditionalAccess();
-          updateAdditionalAccessRoleOptions();
-          document.getElementById("data-origin").textContent = forceSource
-            ? "Dados recarregados"
-            : "Dados sincronizados";
-          updateDataTimestamp(response.meta && response.meta.generatedAt);
-          setWorkspaceState("ready", "Sincronizado");
-
-          if (!quiet) {
-            showToast(
-              forceSource
-                ? `${formatCount(appState.rows.length)} registros recarregados.`
-                : `${formatCount(appState.rows.length)} registros atualizados.`,
-              "success"
-            );
-          }
+          const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          if (sequence !== appState.loadSequence) return false;
+          acceptBootstrap(response);
+          renderBootstrap(response);
+          if (!quiet) showToast(formatCount(appState.rows.length) + " registros atualizados.", "success");
+          return true;
         } catch (error) {
-          setWorkspaceState("error", "Conexão pendente");
-          document.getElementById("members-table").hidden = true;
-          const tableState = document.getElementById("table-state");
-          tableState.hidden = false;
-          tableState.textContent = error.message;
-          document.getElementById("table-result").textContent =
-            "Não foi possível carregar";
-          showToast(error.message, "error");
+          if (sequence !== appState.loadSequence) return false;
+          appState.requiresRefresh = true;
+          setWorkspaceState("error", "Atualização necessária");
+          if (!appState.loaded) {
+            document.getElementById("members-table").hidden = true;
+            document.getElementById("table-state").hidden = false;
+            document.getElementById("table-state").textContent = error.message;
+          }
+          showToast(error.message + " Edição bloqueada até atualizar com sucesso.", "error");
+          return false;
         } finally {
-          setDataLoading(false);
+          if (sequence === appState.loadSequence) setDataLoading(false);
         }
       }
 
@@ -3161,7 +3154,7 @@
       }
 
       function openSettingsEditor(rowNumber) {
-        if (!requireEditAccess()) return;
+        if (!requireEditAccess() || appState.settingsSaving || appState.loading || appState.requiresRefresh) return;
         const item = appState.settings.find((entry) => entry.row === rowNumber);
         if (!item) return;
 
@@ -3199,56 +3192,47 @@
         );
         fields.append(roleField, vacanciesField);
 
-        document.getElementById("settings-editor").showModal();
+        const dialog = document.getElementById("settings-editor");
+        dialog.oncancel = event => { if (appState.settingsSaving) event.preventDefault(); };
+        dialog.showModal();
       }
 
       function closeSettingsEditor() {
+        if (appState.settingsSaving) return;
         appState.editingSettingsRow = null;
         document.getElementById("settings-editor").close();
       }
 
       async function saveRoleSettings(event) {
         event.preventDefault();
-        if (!requireEditAccess()) return;
-        const item = appState.settings.find(
-          (entry) => entry.row === appState.editingSettingsRow
-        );
+        if (!requireEditAccess() || appState.settingsSaving) return;
+        const item = appState.settings.find(entry => entry.row === appState.editingSettingsRow);
         if (!item) return;
-
-        const button = document.getElementById("save-settings");
-        const inputs = Array.from(
-          document.querySelectorAll(
-            "#settings-editor-fields input, #settings-editor-fields select"
-          )
-        ).sort((left, right) => Number(left.dataset.index) - Number(right.dataset.index));
-        const values = inputs.map((input) => input.value.trim());
-
-        button.disabled = true;
-        button.textContent = "Salvando…";
-
-        try {
-          await requestNexusList("saveSettings", {
-            rows: [
-              {
-                row: item.row,
-                role: values[0],
-                vacancies: values[1]
-              }
-            ]
-          });
-
-          item.role = values[0];
-          item.vacancies = values[1] === "" ? "" : Number(values[1]);
-          closeSettingsEditor();
-          renderSettings();
-          updateDataTimestamp();
-          showToast("Cargo e vagas atualizados.", "success");
-        } catch (error) {
-          showToast(error.message, "error");
-        } finally {
-          button.disabled = false;
-          button.textContent = "Salvar cargo";
+        const role = document.getElementById("settings-field-0").value.trim();
+        const vacanciesText = document.getElementById("settings-field-1").value.trim();
+        if (!role || (vacanciesText && (!/^\d+$/.test(vacanciesText) || !Number.isSafeInteger(Number(vacanciesText))))) {
+          showToast("Selecione um cargo e informe vagas inteiras não negativas.", "warning"); return;
         }
+        appState.settingsSaving = true;
+        const button = document.getElementById("save-settings"); button.disabled = true;
+        updateMemberEditControls();
+        try {
+          const latest = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          decodeBootstrap(latest);
+          const serverItem = latest.settings.rows.find(entry => Number(entry.row) === Number(item.row));
+          if (!serverItem || canonicalRoleName(serverItem.role) !== item.role || String(serverItem.vacancies ?? "") !== String(item.vacancies ?? "")) {
+            throw new Error("Esta configuração mudou. Atualize a lista antes de editar.");
+          }
+          await requestNexusList("saveSettings", { rows: [{ row: item.row, role, vacancies: vacanciesText }], expectedRevision: latest.meta?.revision ?? null });
+          const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          const decoded = decodeBootstrap(response);
+          const saved = response.settings.rows.find(entry => Number(entry.row) === Number(item.row));
+          if (!saved || canonicalRoleName(saved.role) !== canonicalRoleName(role) || String(saved.vacancies ?? "") !== vacanciesText) throw new Error("A API não confirmou o cargo e as vagas enviados. Atualize para conferir.");
+          acceptBootstrap(response, decoded); renderBootstrap(response);
+          appState.settingsSaving = false; closeSettingsEditor();
+          showToast("Cargo e vagas confirmados na planilha.", "success");
+        } catch (error) { appState.requiresRefresh = true; showToast(error.message, "error"); }
+        finally { appState.settingsSaving = false; button.disabled = false; updateMemberEditControls(); }
       }
 
       function createEditorFieldset(title, description) {
@@ -3460,6 +3444,7 @@
 
       function openLayoutEditor() {
         if (!requireEditAccess()) return;
+        if (appState.settingsSaving || appState.loading || appState.requiresRefresh) return;
         const owner = getLayoutOwner();
         if (!owner) return;
 
@@ -3550,17 +3535,20 @@
             input.addEventListener("input", updateLayoutColorPreview)
           );
         updateLayoutLivePreview();
-        document.getElementById("layout-editor").showModal();
+        const dialog = document.getElementById("layout-editor");
+        dialog.oncancel = event => { if (appState.settingsSaving) event.preventDefault(); };
+        dialog.showModal();
       }
 
       function closeLayoutEditor() {
+        if (appState.settingsSaving) return;
         appState.editingLayoutOwnerRow = null;
         document.getElementById("layout-editor").close();
       }
 
       async function saveLayoutSettings(event) {
         event.preventDefault();
-        if (!requireEditAccess()) return;
+        if (!requireEditAccess() || appState.settingsSaving) return;
         const owner = appState.settings.find(
           (item) => item.row === appState.editingLayoutOwnerRow
         );
@@ -3570,6 +3558,10 @@
         const links = Array.from({ length: 2 }, (_, index) =>
           document.getElementById(`layout-link-${index}`).value.trim()
         );
+        if ([banner, ...links].some(value => {
+          if (!value) return false;
+          try { return !["http:", "https:"].includes(new URL(value).protocol); } catch { return true; }
+        })) { showToast("Use links HTTP ou HTTPS válidos para o banner e as comunidades.", "warning"); return; }
         const colors = new Map(
           Array.from(
             document.querySelectorAll("[data-layout-color-row]")
@@ -3586,6 +3578,9 @@
             input.value.trim()
           ])
         );
+        if ([...colors].some(([row, value]) => value && !validPreviewStyleValue(value, row === 18 ? "--directory-shadow" : "color"))) {
+          showToast("Corrija os valores de cor ou sombra inválidos antes de salvar.", "warning"); return;
+        }
         const updates = new Map();
 
         function mergeUpdate(row, fields) {
@@ -3620,13 +3615,31 @@
           return;
         }
 
+        appState.settingsSaving = true;
         const button = document.getElementById("save-layout");
         button.disabled = true;
         button.textContent = "Salvando…";
+        updateMemberEditControls();
 
         try {
           const rows = Array.from(updates.values());
-          await requestNexusList("saveSettings", { rows });
+          const before = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          decodeBootstrap(before);
+          for (const update of rows) {
+            const old = appState.settings.find(item => Number(item.row) === Number(update.row));
+            const live = before.settings.rows.find(item => Number(item.row) === Number(update.row));
+            if (!live || Object.keys(update).filter(key => key !== "row").some(key => JSON.stringify(live[key] ?? (key === "links" ? [] : "")) !== JSON.stringify(old?.[key] ?? (key === "links" ? [] : "")))) {
+              throw new Error("Os recursos foram alterados por outra pessoa. Atualize antes de salvar.");
+            }
+          }
+          await requestNexusList("saveSettings", { rows, expectedRevision: before.meta?.revision ?? null });
+          const confirmed = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          const decoded = decodeBootstrap(confirmed);
+          for (const update of rows) {
+            const saved = confirmed.settings.rows.find(item => Number(item.row) === Number(update.row));
+            if (!saved || Object.keys(update).filter(key => key !== "row").some(key => JSON.stringify(saved[key] ?? (key === "links" ? [] : "")) !== JSON.stringify(update[key]))) throw new Error("A API não confirmou os recursos enviados. Atualize para conferir.");
+          }
+          acceptBootstrap(confirmed, decoded);
 
           rows.forEach((update) => {
             const item = appState.settings.find(
@@ -3647,13 +3660,17 @@
             }
           });
 
+          appState.settingsSaving = false;
           closeLayoutEditor();
           renderSettings();
           updateDataTimestamp();
           showToast("Recursos do BBCode atualizados.", "success");
         } catch (error) {
+          appState.requiresRefresh = true;
           showToast(error.message, "error");
         } finally {
+          appState.settingsSaving = false;
+          updateMemberEditControls();
           button.disabled = false;
           button.textContent = "Salvar recursos";
         }
@@ -3706,12 +3723,8 @@
         let response;
 
         try {
-          response = await fetch(new URL("/forum", CONFIG.forum.origin), {
-            method: "GET",
-            credentials: "include",
-            redirect: "follow",
-            cache: "no-store"
-          });
+          const fetched = await fetchForumWithTimeout(new URL("/forum", CONFIG.forum.origin), { method: "GET", credentials: "include", redirect: "follow", cache: "no-store" });
+          response = { ok: fetched.response.ok, text: async () => fetched.html };
         } catch {
           if (runtimeSession) return runtimeSession.username;
           throw new Error("Não foi possível consultar sua sessão no fórum.");
@@ -3832,6 +3845,8 @@
         return userFromAccess(access, username);
       }
 
+      let authenticationInFlight = null;
+
       function scheduleAuthenticationRevalidation() {
         if (authRevalidationTimer) {
           window.clearInterval(authRevalidationTimer);
@@ -3842,49 +3857,32 @@
       }
 
       async function revalidateAuthentication(options = {}) {
-        try {
-          const user = await validateForumAccess();
-          allowAccess(user);
-          scheduleAuthenticationRevalidation();
-
-          if (options.reloadData) {
-            await loadNexusList({ quiet: true, forceSource: true });
+        if (authenticationInFlight) return authenticationInFlight;
+        authenticationInFlight = (async () => {
+          try {
+            const user = await validateForumAccess();
+            const changedUser = currentUser && normalizeLookup(currentUser.nick) !== normalizeLookup(user.nick);
+            if (changedUser) {
+              appState.editingMembers = false; appState.removingMembers = false; appState.addingMember = false;
+              appState.memberDrafts.clear(); appState.selectedMemberRows.clear();
+              appState.loaded = false; appState.requiresRefresh = true;
+            }
+            allowAccess(user); scheduleAuthenticationRevalidation();
+            if (options.reloadData || !appState.loaded || changedUser) await loadNexusList({ quiet: true, forceSource: true });
+            if (options.honorInitialHash && window.location.hash === "#configuracoes" && canCurrentUserEdit(user)) navigateToView("settings", { force: true });
+            if (options.announce) showToast("", "success", "Bem-vindo, " + user.nick);
+            return user;
+          } catch (error) {
+            if (error?.code === "AUTH_DENIED") { denyAccess(error.message); throw error; }
+            if (currentUser) {
+              allowAccess(currentUser, { validationUnavailable: true });
+              scheduleAuthenticationRevalidation(); return currentUser;
+            }
+            showAuthenticationUnavailable(error?.message || "Não foi possível consultar o serviço de acesso.");
+            scheduleAuthenticationRevalidation(); return null;
           }
-          if (
-            options.honorInitialHash &&
-            window.location.hash === "#configuracoes" &&
-            canCurrentUserEdit(user)
-          ) {
-            navigateToView("settings", { force: true });
-          }
-          if (options.announce) {
-            showToast("", "success", `Bem-vindo, ${user.nick}`);
-          }
-          return user;
-        } catch (error) {
-          if (error && error.code === "AUTH_DENIED") {
-            denyAccess(
-              error.message ||
-                "Seu usuário não possui permissão para acessar a NexusList."
-            );
-            throw error;
-          }
-
-          if (currentUser) {
-            const preservedUser = currentUser;
-            allowAccess(preservedUser, { validationUnavailable: true });
-            scheduleAuthenticationRevalidation();
-            return preservedUser;
-          }
-
-          showAuthenticationUnavailable(
-            error && error.message
-              ? error.message
-              : "Não foi possível consultar o serviço de acesso."
-          );
-          scheduleAuthenticationRevalidation();
-          return null;
-        }
+        })();
+        try { return await authenticationInFlight; } finally { authenticationInFlight = null; }
       }
 
       async function initializeAuthentication() {
