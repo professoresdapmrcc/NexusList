@@ -1,5 +1,4 @@
- 
-    (() => {
+(() => {
       "use strict";
 
       const THEME_STORAGE_KEY = "NEXUSLIST_THEME";
@@ -359,6 +358,10 @@
         publishingUncertain: false
       });
 
+      function isDashPlaceholder(value) {
+        return /^[-–—]+$/.test(String(value ?? "").trim());
+      }
+
       function memberKey(values, headers = appState.headers) {
         const index = headers.findIndex(header => headerKey(header) === "NICKNAME");
         return String(values[index] ?? "").trim().toLocaleLowerCase("pt-BR");
@@ -383,11 +386,32 @@
           }
           seenRows.add(Number(row.row));
           // values is the API's canonical result. Do not overwrite it with source/saved.
-          const values = Array.isArray(row.values) ? row.values.slice()
+          const rawValues = Array.isArray(row.values) ? row.values.slice()
             : row.hasSaved && Array.isArray(row.saved) ? row.saved.slice()
             : Array.isArray(row.source) ? row.source.slice() : null;
-          if (!values || values.length !== headers.length) throw new Error("Uma linha não corresponde aos cabeçalhos da planilha.");
-          if (!values.some(value => String(value ?? "").trim())) continue;
+          if (!rawValues || rawValues.length !== headers.length) throw new Error("Uma linha não corresponde aos cabeçalhos da planilha.");
+
+          const hasMeaningfulData = rawValues.some((value, idx) => {
+            const text = String(value ?? "").trim();
+            if (!text || isDashPlaceholder(text)) return false;
+            if (["G", "GP", "RL", "REB", "PA"].includes(keys[idx]) && text.toLowerCase() === "false") {
+              return false;
+            }
+            return true;
+          });
+          if (!hasMeaningfulData) continue;
+
+          const values = rawValues.map((value, idx) => {
+            const text = String(value ?? "").trim();
+            if (DATE_HEADER_KEYS.includes(keys[idx]) && isDashPlaceholder(text)) {
+              return "";
+            }
+            if (keys[idx] === "DIAS" && (isDashPlaceholder(text) || text === "0")) {
+              return "";
+            }
+            return value;
+          });
+
           const key = memberKey(values, headers);
           if (!key || seenMembers.has(key)) throw new Error("Nickname ausente ou duplicado na base. Corrija a planilha antes de editar.");
           seenMembers.add(key);
@@ -406,7 +430,11 @@
         const key = headerKey(header);
         const text = String(value ?? "").trim();
         if (["G", "GP", "RL", "REB", "PA"].includes(key)) return text.toLowerCase();
-        if (DATE_HEADER_KEYS.includes(key) && parseNexusDate(text)) return nexusDateToIso(text);
+        if (DATE_HEADER_KEYS.includes(key)) {
+          if (!text || isDashPlaceholder(text)) return "";
+          if (parseNexusDate(text)) return nexusDateToIso(text);
+        }
+        if (key === "DIAS" && (!text || isDashPlaceholder(text) || text === "0")) return "";
         return text;
       }
 
@@ -707,9 +735,12 @@
         appState.loading = isLoading;
         document.getElementById("refresh-members").disabled =
           isLoading ||
+          appState.savingMembers ||
+          appState.settingsSaving ||
           appState.editingMembers ||
           appState.removingMembers ||
-          appState.addingMember;
+          appState.addingMember ||
+          appState.requirementsBusy;
         document.getElementById("refresh-settings").disabled = isLoading;
         document.getElementById("edit-layout").hidden =
           !canCurrentUserEdit();
@@ -935,20 +966,24 @@
       }
 
       function parseNexusDate(value) {
-        const raw = String(value || "").trim();
-        if (!raw) return null;
+        const raw = String(value || "").replace(/\s+/g, " ").trim();
+        if (!raw || isDashPlaceholder(raw)) return null;
 
         let year;
         let month;
         let day;
-        let match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        let match = raw.match(
+          /^(\d{4})-(\d{2})-(\d{2})(?:[T\s]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/
+        );
 
         if (match) {
           year = Number(match[1]);
           month = Number(match[2]) - 1;
           day = Number(match[3]);
         } else {
-          match = raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);
+          match = raw.match(
+            /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?$/
+          );
           if (match) {
             day = Number(match[1]);
             month = Number(match[2]) - 1;
@@ -1009,8 +1044,10 @@
       }
 
       function formatNexusDate(value) {
-        const parsed = parseNexusDate(value);
-        if (!parsed) return String(value || "").trim();
+        const raw = String(value || "").trim();
+        if (!raw || isDashPlaceholder(raw)) return "";
+        const parsed = parseNexusDate(raw);
+        if (!parsed) return raw;
         return `${String(parsed.day).padStart(2, "0")} ${
           NEXUS_MONTHS[parsed.month]
         } ${parsed.year}`;
@@ -1046,6 +1083,15 @@
       function applyCalculatedReturnDate(values) {
         const next = values.slice();
         const indexes = memberFieldIndexes();
+        if (indexes.licenseStart >= 0 && isDashPlaceholder(next[indexes.licenseStart])) {
+          next[indexes.licenseStart] = "";
+        }
+        if (indexes.licenseDays >= 0) {
+          const daysText = String(next[indexes.licenseDays] ?? "").trim();
+          if (isDashPlaceholder(daysText) || daysText === "0") {
+            next[indexes.licenseDays] = "";
+          }
+        }
         if (indexes.licenseReturn >= 0 && indexes.licenseStart >= 0 && indexes.licenseDays >= 0) {
           next[indexes.licenseReturn] = calculateMemberReturnDate(next[indexes.licenseStart], next[indexes.licenseDays]);
         }
@@ -1080,18 +1126,23 @@
           return normalized;
         }
 
-        return normalized.map((value, index) =>
-          isDateColumn(index) && parseNexusDate(value)
-            ? formatNexusDate(value)
-            : value
-        );
+        return normalized.map((value, index) => {
+          if (!isDateColumn(index)) return value;
+          const raw = String(value ?? "").trim();
+          if (!raw || isDashPlaceholder(raw)) return "";
+          return parseNexusDate(raw) ? formatNexusDate(raw) : raw;
+        });
       }
 
       function validateLicenseValues(values) {
         if (isConsultantRole(values[memberFieldIndexes().role])) return;
         const { licenseStart, licenseDays } = memberFieldIndexes();
-        const start = String(values[licenseStart] ?? "").trim();
-        const days = String(values[licenseDays] ?? "").trim();
+        const rawStart = String(values[licenseStart] ?? "").trim();
+        const rawDays = String(values[licenseDays] ?? "").trim();
+        const start = isDashPlaceholder(rawStart) ? "" : rawStart;
+        const days = isDashPlaceholder(rawDays) || rawDays === "0" ? "" : rawDays;
+        if (licenseStart >= 0) values[licenseStart] = start;
+        if (licenseDays >= 0) values[licenseDays] = days;
         if (!start && !days) return;
         if (licenseStart < 0 || licenseDays < 0 || !calculateMemberReturnDate(start, days)) {
           throw new Error("Licença inválida: informe início válido e um número inteiro positivo de dias.");
@@ -1101,8 +1152,23 @@
       function assertRequiredMemberFields(values, rowNumber = null) {
         validateLicenseValues(values);
         const indexes = memberFieldIndexes();
+        const nicknameLabel =
+          String(values[indexes.nickname] || "").trim() ||
+          (Number.isInteger(rowNumber) ? `linha ${rowNumber}` : "membro sem nickname");
+
         for (const index of [indexes.entry, indexes.promotion]) {
-          if (index >= 0 && String(values[index] ?? "").trim() && !parseNexusDate(values[index])) throw new Error("Data inválida no cadastro do membro.");
+          if (index < 0) continue;
+          const raw = String(values[index] ?? "").trim();
+          if (!raw || isDashPlaceholder(raw)) {
+            values[index] = "";
+            continue;
+          }
+          if (!parseNexusDate(raw)) {
+            const columnName = appState.headers[index] || "Data";
+            throw new Error(
+              `Data inválida em ${columnName} ("${raw}") no cadastro de ${nicknameLabel}.`
+            );
+          }
         }
         const missing = [
           { index: indexes.role, label: "CARGO" },
@@ -1260,8 +1326,8 @@
 
         return draft.some(
           (value, index) =>
-            String(value ?? "").trim() !==
-            String(baseline[index] ?? "").trim()
+            cellFingerprint(value, appState.headers[index]) !==
+            cellFingerprint(baseline[index], appState.headers[index])
         );
       }
 
@@ -1379,7 +1445,15 @@
           label: `Cargo de ${row.values[1] || "membro"}`,
           onChange: (nextRole) => {
             const draft = memberDraft(row).slice();
+            const wasConsultant = isConsultantRole(draft[columnIndex]);
             draft[columnIndex] = nextRole;
+            if (wasConsultant && !isConsultantRole(nextRole)) {
+              appState.booleanColumns.forEach((boolIndex) => {
+                if (!String(draft[boolIndex] ?? "").trim()) {
+                  draft[boolIndex] = "FALSE";
+                }
+              });
+            }
             appState.memberDrafts.set(
               row.row,
               draft
@@ -1394,22 +1468,32 @@
 
       function updateMemberCalculatedReturn(row, draft) {
         const indexes = memberFieldIndexes();
-        const calculatedDraft = applyCalculatedReturnDate(draft, {
-          clearIncomplete: true
-        });
+        const calculatedDraft = applyCalculatedReturnDate(draft);
         appState.memberDrafts.set(row.row, calculatedDraft);
 
         if (indexes.licenseReturn >= 0) {
           const tableRow = document.querySelector(
             `[data-member-row="${row.row}"]`
           );
+          const returnValue = calculatedDraft[indexes.licenseReturn] || "";
           const returnInput = tableRow?.querySelector(
             `.date-control__native[data-index="${indexes.licenseReturn}"]`
           );
-          setDateControlValue(
-            returnInput?.closest(".date-control"),
-            calculatedDraft[indexes.licenseReturn]
-          );
+          if (returnInput) {
+            setDateControlValue(
+              returnInput.closest(".date-control"),
+              returnValue
+            );
+          } else {
+            const returnCellSpan = tableRow?.querySelector(
+              `td[data-column-index="${indexes.licenseReturn}"] .table-cell`
+            );
+            if (returnCellSpan) {
+              returnCellSpan.textContent = returnValue || "—";
+              returnCellSpan.title = returnValue;
+              returnCellSpan.classList.toggle("is-empty", !returnValue);
+            }
+          }
           tableRow?.classList.toggle("is-dirty", isMemberRowDirty(row));
         }
         return calculatedDraft;
@@ -1473,7 +1557,7 @@
         input.className = "table-input";
         input.type = columnIndex === indexes.licenseDays ? "number" : "text";
         if (columnIndex === indexes.licenseDays) {
-          input.min = "0";
+          input.min = "1";
           input.step = "1";
           input.inputMode = "numeric";
         }
@@ -1598,6 +1682,7 @@
 
           appState.headers.forEach((_, index) => {
             const cell = document.createElement("td");
+            cell.dataset.columnIndex = String(index);
             const value = memberDraft(row)[index] ?? "";
             const consultant = isConsultantRole(
               memberDraft(row)[indexes.role]
@@ -1765,7 +1850,13 @@
         );
 
         document.getElementById("refresh-members").disabled =
-          isBusy || isEditing || isRemoving;
+          appState.loading ||
+          appState.savingMembers ||
+          appState.settingsSaving ||
+          appState.requirementsBusy ||
+          isEditing ||
+          isRemoving ||
+          appState.addingMember;
         renderLicenseWorkflow();
       }
 
@@ -2052,7 +2143,7 @@
                     ? ".Brendon / Lintre ou .Brendon, Lintre"
                     : "Preencha este campo",
                 type: isDaysField ? "number" : "text",
-                min: isDaysField ? 0 : undefined
+                min: isDaysField ? 1 : undefined
               }
             );
             if (isNicknameField) {
@@ -2244,7 +2335,10 @@
         if (appState.savingMembers) return;
         appState.removingMembers = false;
         appState.selectedMemberRows.clear();
-        setWorkspaceState("ready", "Sincronizado");
+        setWorkspaceState(
+          appState.requiresRefresh ? "error" : "ready",
+          appState.requiresRefresh ? "Atualização necessária" : "Sincronizado"
+        );
         updateMemberEditControls();
         renderMembers();
       }
