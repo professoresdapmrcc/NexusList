@@ -158,6 +158,41 @@ test('ok:true sem valores persistidos não produz confirmação falsa', async t 
   await assert.rejects(h.persistCompactMemberList([modified]), /não confirmou/);
   assert.equal(h.appState.requiresRefresh, true);
 });
+
+test('checkbox em português confirma o mesmo valor lógico e preserva estado vazio', async t => {
+  const h = setup(t); ready(h); silence(h);
+  const expected = member(); expected.values[8] = 'TRUE'; expected.values[9] = 'FALSE';
+  const actual = member(); actual.values[8] = 'VERDADEIRO'; actual.values[9] = 'FALSO';
+  h.set('requestNexusList', async () => bootstrap([actual]));
+  await h.confirmMemberWrite([expected]);
+  assert.equal(h.appState.requiresRefresh, false);
+  assert.equal(h.booleanState('VERDADEIRO'), 'true');
+  assert.notEqual(h.cellFingerprint('', 'RL'), h.cellFingerprint('FALSE', 'RL'));
+});
+
+test('releitura temporariamente antiga repete apenas GET e confirma sem reenviar POST', async t => {
+  const h = setup(t); ready(h); silence(h); const calls = []; let readsAfterWrite = 0; let written = false;
+  const expected = member(); expected.values[8] = 'TRUE';
+  h.set('requestNexusList', async (action, payload, options) => {
+    calls.push(action);
+    if (action === 'organizeData') { written = true; return { ok: true }; }
+    if (!written) return bootstrap();
+    assert.equal(options.forceRefresh, true);
+    return ++readsAfterWrite === 1 ? bootstrap() : bootstrap([expected]);
+  });
+  await h.persistCompactMemberList([expected]);
+  assert.equal(calls.filter(action => action === 'organizeData').length, 1);
+  assert.equal(readsAfterWrite, 2);
+  assert.equal(h.appState.requiresRefresh, false);
+});
+
+test('divergência persistente informa membro e campo sem anunciar sucesso', async t => {
+  const h = setup(t); ready(h); silence(h); let reads = 0;
+  const expected = member(); expected.values[8] = 'TRUE';
+  h.set('requestNexusList', async () => { reads++; return bootstrap(); });
+  await assert.rejects(h.confirmMemberWrite([expected]), /Teste, campo RL: enviado "TRUE"; recebido "FALSE"/);
+  assert.equal(reads, 3); assert.equal(h.appState.requiresRefresh, true);
+});
 test('retorno de licença com linha de outro membro não é enviado', async t => {
   const h = setup(t); ready(h); const messages = silence(h); const calls = [];
   h.set('requestNexusList', async action => {

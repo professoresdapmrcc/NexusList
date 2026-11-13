@@ -440,7 +440,10 @@
       function cellFingerprint(value, header) {
         const key = headerKey(header);
         const text = String(value ?? "").trim();
-        if (["G", "GP", "RL", "REB", "PA"].includes(key)) return text.toLowerCase();
+        if (["G", "GP", "RL", "REB", "PA"].includes(key)) {
+          const state = booleanState(text);
+          return state === "empty" ? text.toLowerCase() : state;
+        }
         if (DATE_HEADER_KEYS.includes(key)) {
           if (!text || isDashPlaceholder(text)) return "";
           if (parseNexusDate(text)) return nexusDateToIso(text);
@@ -515,8 +518,16 @@
       }
 
       async function confirmMemberWrite(expectedRows) {
-        const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
-        const decoded = decodeBootstrap(response);
+        let response;
+        let decoded;
+        // Retry only the read: a successful POST must never be sent again.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (attempt) await new Promise(resolve => window.setTimeout(resolve, attempt * 500));
+          response = await requestNexusList("bootstrap", null, { forceRefresh: true });
+          decoded = decodeBootstrap(response);
+          if (memberSnapshot(appState.headers, []) === memberSnapshot(decoded.headers, []) &&
+              editableSnapshot(decoded.rows) === editableSnapshot(expectedRows)) break;
+        }
         if (memberSnapshot(appState.headers, []) !== memberSnapshot(decoded.headers, []) ||
             editableSnapshot(decoded.rows) !== editableSnapshot(expectedRows)) {
           appState.requiresRefresh = true;
@@ -530,7 +541,22 @@
             const actual = decoded.rows.find(actual => actual.row === changed.row);
             throw new Error(`A planilha/API devolveu o nickname "${actual.values[nicknameIndex]}" em vez de "${changed.values[nicknameIndex]}". Configure NICKNAME como texto simples no Apps Script e corrija a célula. O ponto não será removido nem inventado pela interface.`);
           }
-          throw new Error("A leitura após o envio não confirmou todos os valores. Atualize e confira a lista; não repita o envio automaticamente.");
+          const actualMembers = new Map(decoded.rows.map(row => [memberKey(row.values), row]));
+          let detail = "";
+          for (const expected of expectedRows) {
+            const actual = actualMembers.get(memberKey(expected.values));
+            if (!actual) { detail = `Cadastro de ${nicknameText(expected.values[nicknameIndex])} não encontrado na releitura.`; break; }
+            const index = expected.values.findIndex((value, column) => !isFormulaMemberColumn(column) &&
+              cellFingerprint(value, appState.headers[column]) !== cellFingerprint(actual.values[column], appState.headers[column]));
+            if (index !== -1) {
+              detail = `${nicknameText(expected.values[nicknameIndex])}, campo ${appState.headers[index]}: enviado ${JSON.stringify(expected.values[index])}; recebido ${JSON.stringify(actual.values[index])}.`;
+              break;
+            }
+          }
+          if (!detail) detail = decoded.rows.length !== expectedRows.length
+            ? `Quantidade de cadastros: enviados ${expectedRows.length}; recebidos ${decoded.rows.length}.`
+            : "Os cabeçalhos da planilha mudaram durante a gravação.";
+          throw new Error(`A leitura após o envio não confirmou todos os valores. ${detail} A gravação pode ter sido aplicada; atualize e confira a lista, sem repetir o envio.`);
         }
         acceptBootstrap(response, decoded);
         renderBootstrap(response);
@@ -1323,8 +1349,8 @@
 
       function booleanState(value) {
         const normalized = String(value ?? "").trim().toLowerCase();
-        if (normalized === "true") return "true";
-        if (normalized === "false") return "false";
+        if (["true", "verdadeiro"].includes(normalized)) return "true";
+        if (["false", "falso"].includes(normalized)) return "false";
         return "empty";
       }
 
