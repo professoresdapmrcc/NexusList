@@ -42,6 +42,14 @@ Um timeout do navegador não cancela necessariamente uma operação que já cheg
 
 ## Testes
 
+### Nicknames com ponto ou zeros iniciais
+
+Nicknames são tratados como texto e comparados sem remover pontuação: `.999`, `999`, `9.99` e `00999` são identidades distintas, inclusive nos acessos adicionais e na troca de sessão. A interface envia `textColumns: ["NICKNAME"]` em `organizeData`, mas esse metadado só tem efeito no servidor se ele o implementar.
+
+Se a linha já chega da API como `999`, o ponto original não pode ser recuperado com segurança pelo JavaScript. Na planilha, formate NICKNAME como **Texto simples** e digite novamente `.999`. Só mudar a formatação não recupera caracteres perdidos.
+
+Se salvar `.999` e ele voltar como `999` ou `0.999`, a releitura bloqueia a confirmação e informa a divergência. O Apps Script precisa formatar a coluna antes de gravar. O helper em `apps-script/nicknames-como-texto.gs` está pronto para integrar ao handler `organizeData`; adicioná-lo ao Git não altera automaticamente o Web App do Google. Não substitua o handler inteiro por esse helper e mantenha a proteção de revisão/LockService existente.
+
 Node.js 22 ou mais recente:
 
 ```sh

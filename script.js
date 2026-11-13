@@ -362,9 +362,18 @@
         return /^[-–—]+$/.test(String(value ?? "").trim());
       }
 
+      function nicknameText(value) {
+        // Never run role/header normalization or numeric parsing on identities.
+        return String(value ?? "").normalize("NFC").trim();
+      }
+
+      function nicknameIdentity(value) {
+        return nicknameText(value).toLocaleLowerCase("pt-BR");
+      }
+
       function memberKey(values, headers = appState.headers) {
         const index = headers.findIndex(header => headerKey(header) === "NICKNAME");
-        return String(values[index] ?? "").trim().toLocaleLowerCase("pt-BR");
+        return nicknameIdentity(values[index]);
       }
 
       function decodeBootstrap(response) {
@@ -402,6 +411,7 @@
           if (!hasMeaningfulData) continue;
 
           const values = rawValues.map((value, idx) => {
+            if (keys[idx] === "NICKNAME") return nicknameText(value);
             const text = String(value ?? "").trim();
             if (DATE_HEADER_KEYS.includes(keys[idx]) && isDashPlaceholder(text)) {
               return "";
@@ -415,7 +425,8 @@
           const key = memberKey(values, headers);
           if (!key || seenMembers.has(key)) throw new Error("Nickname ausente ou duplicado na base. Corrija a planilha antes de editar.");
           seenMembers.add(key);
-          rows.push({ ...row, row: Number(row.row), values, saved: values.slice(), hasSaved: true });
+          rows.push({ ...row, row: Number(row.row), values, saved: values.slice(), hasSaved: true,
+            nicknameReceivedAsNumber: typeof rawValues[keys.indexOf("NICKNAME")] === "number" });
         }
         const formulaColumns = new Set();
         for (const field of response.data.formulaColumns || []) {
@@ -509,6 +520,16 @@
         if (memberSnapshot(appState.headers, []) !== memberSnapshot(decoded.headers, []) ||
             editableSnapshot(decoded.rows) !== editableSnapshot(expectedRows)) {
           appState.requiresRefresh = true;
+          const nicknameIndex = memberFieldIndexes().nickname;
+          const changed = expectedRows.find(expected => {
+            if (decoded.rows.some(actual => memberKey(actual.values) === memberKey(expected.values))) return false;
+            const actual = decoded.rows.find(actual => actual.row === expected.row);
+            return actual && nicknameText(actual.values[nicknameIndex]) !== nicknameText(expected.values[nicknameIndex]);
+          });
+          if (changed) {
+            const actual = decoded.rows.find(actual => actual.row === changed.row);
+            throw new Error(`A planilha/API devolveu o nickname "${actual.values[nicknameIndex]}" em vez de "${changed.values[nicknameIndex]}". Configure NICKNAME como texto simples no Apps Script e corrija a célula. O ponto não será removido nem inventado pela interface.`);
+          }
           throw new Error("A leitura após o envio não confirmou todos os valores. Atualize e confira a lista; não repita o envio automaticamente.");
         }
         acceptBootstrap(response, decoded);
@@ -612,7 +633,7 @@
           requireFreshMembers();
           if (appState.writeUncertain) throw new Error("Atualize e confira a gravação anterior antes de enviar outra alteração.");
           const verified = await validateForumAccess();
-          if (!currentUser || cleanCell(verified.nick).toLocaleLowerCase("pt-BR") !== requestedUsername.toLocaleLowerCase("pt-BR")) {
+          if (!currentUser || nicknameIdentity(verified.nick) !== nicknameIdentity(requestedUsername)) {
             throw new Error("O usuário do fórum mudou. Atualize a página antes de editar.");
           }
           allowAccess(verified);
@@ -843,7 +864,7 @@
           const nicknameIndex = memberFieldIndexes().nickname;
           const identities = pending.map(member => {
             const row = latest.rows.find(row => row.row === Number(member.row));
-            const nickname = String(member.nickname || "").trim().toLocaleLowerCase("pt-BR");
+            const nickname = nicknameIdentity(member.nickname);
             if (!row || !nickname || memberKey(row.values) !== nickname) {
               throw new Error("O retorno de licença não corresponde ao membro da linha. Atualize a lista; nenhum envio foi feito.");
             }
@@ -864,7 +885,7 @@
           const startIndex = decoded.headers.findIndex(header => headerKey(header) === "INICIO");
           const daysIndex = decoded.headers.findIndex(header => headerKey(header) === "DIAS");
           if (rlIndex < 0 || startIndex < 0 || daysIndex < 0 || identities.some(member => {
-            const row = decoded.rows.find(row => memberKey(row.values, decoded.headers) === member.nickname.toLocaleLowerCase("pt-BR"));
+            const row = decoded.rows.find(row => memberKey(row.values, decoded.headers) === nicknameIdentity(member.nickname));
             return !row || booleanState(row.values[rlIndex]) !== "true" ||
               String(row.values[startIndex] ?? "").trim() || String(row.values[daysIndex] ?? "").trim();
           })) throw new Error("O RL e a limpeza da licença não foram confirmados. Confira a planilha antes de prosseguir.");
@@ -1235,7 +1256,7 @@
             );
             assertRequiredMemberFields(values, member.row);
             const nickname = String(values[nicknameIndex] || "").trim();
-            const nicknameKey = nickname.toLocaleLowerCase("pt-BR");
+            const nicknameKey = nicknameIdentity(nickname);
 
             if (nicknameKey) {
               if (seenNicknames.has(nicknameKey)) {
@@ -1279,6 +1300,7 @@
             expectedRevision: latest.revision,
             expectedSnapshot: appState.baseline,
             originalMembers: latest.rows.map(row => ({ row: row.row, nickname: row.values[indexes.nickname] })),
+            textColumns: ["NICKNAME"],
             idempotencyKey: operationId
           });
           return await confirmMemberWrite(rows);
@@ -1564,6 +1586,10 @@
         input.value = value ?? "";
         input.disabled = appState.savingMembers;
         if (columnIndex === indexes.nickname) {
+          input.inputMode = "text";
+          input.autocapitalize = "off";
+          input.spellcheck = false;
+          if (row.nicknameReceivedAsNumber) input.title = "A API enviou este nickname como número. Confira o nome original e mantenha NICKNAME como texto simples na planilha.";
           input.required = true;
           input.setAttribute("aria-required", "true");
         }
@@ -2191,7 +2217,7 @@
           .split(/[\/,]/)
           .map((nickname) => nickname.trim())
           .filter((nickname) => {
-            const key = nickname.toLocaleLowerCase("pt-BR");
+            const key = nicknameIdentity(nickname);
             if (!key || seen.has(key)) return false;
             seen.add(key);
             return true;
@@ -2545,7 +2571,8 @@
       function accessValues(response, accessType) {
         const access = response.additionalAccess;
         if (!access || !Array.isArray(access.nicknames) || !Array.isArray(access.roles)) throw new Error("A API não confirmou a lista de acessos.");
-        return (accessType === "cargo" ? access.roles : access.nicknames).map(value => normalizeLookup(value)).sort();
+        return (accessType === "cargo" ? access.roles : access.nicknames)
+          .map(value => accessType === "cargo" ? normalizeLookup(value) : nicknameIdentity(value)).sort();
       }
 
       async function persistAdditionalAccess(action, accessType, value) {
@@ -2553,14 +2580,16 @@
         const before = await requestNexusList("bootstrap", null, { forceRefresh: true });
         decodeBootstrap(before);
         const serverValues = accessValues(before, accessType);
-        const localValues = (accessType === "cargo" ? appState.additionalAccessRoles : appState.additionalAccess).map(value => normalizeLookup(value)).sort();
+        const localValues = (accessType === "cargo" ? appState.additionalAccessRoles : appState.additionalAccess)
+          .map(value => accessType === "cargo" ? normalizeLookup(value) : nicknameIdentity(value)).sort();
         if (JSON.stringify(serverValues) !== JSON.stringify(localValues)) throw new Error("Os acessos mudaram. Atualize antes de alterar.");
         const result = await requestNexusList(action, { accessType, value, expectedRevision: before.meta?.revision ?? null });
         accessValues(result, accessType);
         const response = await requestNexusList("bootstrap", null, { forceRefresh: true });
         const decoded = decodeBootstrap(response);
         const values = accessValues(response, accessType);
-        const targets = (accessType === "cargo" ? [value] : splitMemberNicknames(value)).map(value => normalizeLookup(value));
+        const targets = (accessType === "cargo" ? [value] : splitMemberNicknames(value))
+          .map(value => accessType === "cargo" ? normalizeLookup(value) : nicknameIdentity(value));
         if (!targets.length || targets.some(target => values.includes(target) !== (action === "addAdditionalAccess"))) throw new Error("A leitura não confirmou a alteração de acesso. Confira antes de tentar novamente.");
         acceptBootstrap(response, decoded); renderBootstrap(response);
         return result;
@@ -3793,8 +3822,8 @@
         const username = cleanCell(userdata.username);
         const loggedIn = Number(userdata.session_logged_in) === 1;
         const userId = Number(userdata.user_id);
-        const anonymous = ["ANONYMOUS", "ANONIMO"].includes(
-          normalizeLookup(username)
+        const anonymous = ["anonymous", "anonimo", "anônimo"].includes(
+          nicknameIdentity(username)
         );
 
         if (!loggedIn || !Number.isInteger(userId) || userId <= 0 || anonymous) {
@@ -3955,7 +3984,7 @@
         authenticationInFlight = (async () => {
           try {
             const user = await validateForumAccess();
-            const changedUser = currentUser && normalizeLookup(currentUser.nick) !== normalizeLookup(user.nick);
+            const changedUser = currentUser && nicknameIdentity(currentUser.nick) !== nicknameIdentity(user.nick);
             if (changedUser) {
               appState.editingMembers = false; appState.removingMembers = false; appState.addingMember = false;
               appState.memberDrafts.clear(); appState.selectedMemberRows.clear();

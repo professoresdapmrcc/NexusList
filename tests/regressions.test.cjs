@@ -341,3 +341,81 @@ test('editor de cargo não fecha por Escape durante uma gravação', t => {
   const event = new h.window.Event('cancel', { cancelable: true }); dialog.dispatchEvent(event);
   assert.equal(event.defaultPrevented, true); assert.equal(dialog.open, true);
 });
+
+test('nickname .999 é preservado na leitura, na tabela e no editor de texto', t => {
+  const h = setup(t); ready(h, bootstrap([member('.999')]));
+  h.renderMembers();
+  assert.match(h.window.document.getElementById('members-table-body').textContent, /\.999/);
+  const input = h.createMemberInput('.999', h.appState.rows[0], 1);
+  assert.equal(input.type, 'text'); assert.equal(input.inputMode, 'text'); assert.equal(input.value, '.999');
+  assert.equal(h.prepareMemberValues(member('.999').values)[1], '.999');
+});
+test('pontos, zeros iniciais e sinais fazem parte da identidade', t => {
+  const h = setup(t);
+  for (const [left, right] of [['.999', '999'], ['.Konnd', 'Konnd'], ['00999', '999'], ['9.99', '.999'], ['-Polz-', 'Polz']]) {
+    assert.notEqual(h.nicknameIdentity(left), h.nicknameIdentity(right));
+  }
+  assert.equal(h.nicknameIdentity(' .KONND '), h.nicknameIdentity('.Konnd'));
+  assert.equal(h.decodeBootstrap(bootstrap([member('.999'), member('999', { row: 3 })])).rows.length, 2);
+});
+test('um nickname já recebido como número não ganha pontuação inventada', t => {
+  const h = setup(t); const row = member(); row.values[1] = 999;
+  const decoded = h.decodeBootstrap(bootstrap([row]));
+  assert.equal(decoded.rows[0].values[1], '999'); assert.equal(decoded.rows[0].nicknameReceivedAsNumber, true);
+});
+test('acessos adicionais não confundem .999 com 999', async t => {
+  const h = setup(t);
+  assert.notDeepEqual(h.accessValues({ additionalAccess: { nicknames: ['.999'], roles: [] } }, 'nickname'),
+    h.accessValues({ additionalAccess: { nicknames: ['999'], roles: [] } }, 'nickname'));
+  const base = { ...bootstrap(), additionalAccess: { nicknames: [], roles: [] } };
+  ready(h, base); silence(h); let reads = 0;
+  h.set('requestNexusList', async action => action === 'addAdditionalAccess'
+    ? { ok: true, additionalAccess: { nicknames: ['999'], roles: [] } }
+    : ++reads === 1 ? base : { ...base, additionalAccess: { nicknames: ['999'], roles: [] } });
+  await assert.rejects(h.persistAdditionalAccess('addAdditionalAccess', 'nickname', '.999'), /não confirmou/);
+});
+test('POST preserva .999 e só aceita confirmação com o mesmo nickname', async t => {
+  const h = setup(t); ready(h); silence(h); let posted;
+  h.set('requestNexusList', async (action, payload) => {
+    if (action === 'organizeData') { posted = payload; return { ok: true }; }
+    return posted ? bootstrap(posted.rows.map(row => ({ row: row.row, values: row.values }))) : bootstrap();
+  });
+  await h.persistCompactMemberList([member('.999')]);
+  assert.equal(posted.rows[0].values[1], '.999'); assert.equal(posted.textColumns[0], 'NICKNAME');
+  assert.equal(h.appState.rows[0].values[1], '.999');
+});
+test('conversão do nickname pelo servidor informa o erro exato sem falso sucesso', async t => {
+  const h = setup(t); ready(h); silence(h); let written = false;
+  h.set('requestNexusList', async action => {
+    if (action === 'organizeData') { written = true; return { ok: true }; }
+    return written ? bootstrap([member('999')]) : bootstrap();
+  });
+  await assert.rejects(h.persistCompactMemberList([member('.999')]), /999.*\.999.*texto simples/);
+  assert.equal(h.appState.requiresRefresh, true);
+});
+test('sessão .999 é distinta da sessão 999 e dispara recarga ao mudar', async t => {
+  const h = setup(t); ready(h); silence(h); h.setUser({ nick: '.999' }); let loads = 0;
+  h.set('validateForumAccess', async () => ({ nick: '999' })); h.set('allowAccess', user => h.setUser(user));
+  h.set('scheduleAuthenticationRevalidation', () => {}); h.set('loadNexusList', async () => { loads++; });
+  await h.revalidateAuthentication(); assert.equal(loads, 1); assert.equal(h.getUser().nick, '999');
+});
+
+test('helper Apps Script formata texto antes de gravar .999 e zeros iniciais', () => {
+  const context = vm.createContext({});
+  vm.runInContext(fs.readFileSync(require.resolve('../apps-script/nicknames-como-texto.gs'), 'utf8'), context);
+  const calls = [];
+  const sheet = { getRange: (...range) => ({
+    setNumberFormat: format => calls.push({ kind: 'format', range, format }),
+    setValues: values => calls.push({ kind: 'write', range, values }),
+  }) };
+  context.gravarLinhasNexusListComoTexto(sheet, 2, [['Professor(a)', '.999'], ['Professor(a)', '00999']], ['CARGO', 'NICKNAME']);
+  assert.equal(calls[0].kind, 'format'); assert.equal(calls[0].format, '@'); assert.deepEqual(calls[0].range, [2, 2, 2, 1]);
+  assert.equal(calls[1].values[0][1], '.999'); assert.equal(calls[1].values[1][1], '00999');
+});
+test('helper Apps Script rejeita nickname numérico antes de modificar a planilha', () => {
+  const context = vm.createContext({});
+  vm.runInContext(fs.readFileSync(require.resolve('../apps-script/nicknames-como-texto.gs'), 'utf8'), context);
+  let changes = 0;
+  assert.throws(() => context.gravarLinhasNexusListComoTexto({ getRange: () => { changes++; } }, 2, [['Professor(a)', 999]], ['CARGO', 'NICKNAME']), /deve chegar como texto/);
+  assert.equal(changes, 0);
+});
