@@ -428,6 +428,21 @@
           rows.push({ ...row, row: Number(row.row), values, saved: values.slice(), hasSaved: true,
             nicknameReceivedAsNumber: typeof rawValues[keys.indexOf("NICKNAME")] === "number" });
         }
+        // RETORNO/TERMINO is derived from INÍCIO + DIAS.  The Sheets API
+        // protects that column from direct writes, so after a compaction its
+        // cached display value can briefly belong to the previous physical
+        // row.  Normalize it from the editable source fields before taking
+        // the snapshot; this keeps refreshes from showing a stale date.
+        const startIndex = keys.findIndex(key => key === "INICIO");
+        const daysIndex = keys.findIndex(key => key === "DIAS");
+        const returnIndex = keys.findIndex(key => key === "RETORNO" || key === "TERMINO");
+        if (startIndex >= 0 && daysIndex >= 0 && returnIndex >= 0) {
+          rows.forEach(row => {
+            row.values[returnIndex] = calculateMemberReturnDate(row.values[startIndex], row.values[daysIndex]);
+            row.saved = row.values.slice();
+          });
+        }
+
         const formulaColumns = new Set();
         for (const field of response.data.formulaColumns || []) {
           const index = typeof field === "number" ? field : keys.indexOf(headerKey(field));

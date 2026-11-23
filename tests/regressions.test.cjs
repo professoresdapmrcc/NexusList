@@ -83,6 +83,15 @@ test('licença sem início e dias limpa retorno antigo', t => {
   const h = setup(t); ready(h); const values = [...member().values]; values[7] = '20 Nov 2026';
   assert.equal(h.prepareMemberValues(values)[7], '');
 });
+test('bootstrap corrige retorno calculado que ficou preso à linha anterior', t => {
+  const h = setup(t);
+  const stale = member();
+  stale.values[5] = '03 Nov 2026';
+  stale.values[6] = '29';
+  stale.values[7] = '18 Nov 2026';
+  const decoded = h.decodeBootstrap(bootstrap([stale]));
+  assert.equal(decoded.rows[0].values[7], '02 Dez 2026');
+});
 for (const days of ['-2', '0', '1.5', 'abc', '999999999']) {
   test('dias inválidos são rejeitados: ' + days, t => {
     const h = setup(t); ready(h); const values = [...member().values]; values[5] = '01 Nov 2026'; values[6] = days;
